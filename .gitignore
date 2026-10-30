@@ -1,3 +1,4 @@
 node_modules
 .env
 sokh-bilash-firebase-admin-sdk.json
+.gurbage
