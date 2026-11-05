@@ -14,6 +14,10 @@ const {
 
 const registerCommerceRoutes = require("./routes/commerce.routes");
 
+const registerProfileRoutes = require("./routes/profile.routes");
+
+const registerWishlistRoutes = require("./routes/wishlist.routes");
+
 //================== middleware =====================
 app.use(express.json());
 app.use(cors());
@@ -81,7 +85,7 @@ async function run() {
   const carts = DB.collection("carts");
   const orders = DB.collection("orders");
 
-    // ==========================================
+  // ==========================================
   // ADMIN MIDDLEWARE
   // ==========================================
 
@@ -115,6 +119,13 @@ async function run() {
   // COMMON HELPERS
   // ==========================================
 
+  registerProfileRoutes({
+    app,
+    users,
+    verifyFirebaseToken,
+    verifyAdmin,
+  });
+
   await registerCommerceRoutes({
     app,
     DB,
@@ -122,6 +133,14 @@ async function run() {
     products,
     verifyFirebaseToken,
     verifyAdmin,
+  });
+
+  await registerWishlistRoutes({
+    app,
+    DB,
+    users,
+    products,
+    verifyFirebaseToken,
   });
 
   const respondError = (res, error, label) => {
@@ -180,8 +199,6 @@ async function run() {
 
   const parsePage = (value) =>
     Math.min(10000, Math.max(1, Number.parseInt(value, 10) || 1));
-
-
 
   // ==========================================
   // MULTILINGUAL SEARCH HELPERS
@@ -306,88 +323,405 @@ async function run() {
   };
 
   // ==========================================
-  // DEFAULT CATEGORIES & OCCASIONS
+  // DEFAULT CATEGORIES
   // ==========================================
 
   const DEFAULT_CATEGORIES = [
-    ["photo-frames", "ফটো ফ্রেম ও স্মৃতির উপহার", "Photo+Frames"],
-    ["magic-mirror-led", "ম্যাজিক মিরর ও LED গিফট", "Magic+Mirror"],
-    ["personalized", "কাস্টমাইজড ও পার্সোনালাইজড গিফট", "Personalized+Gifts"],
-    ["gift-combos", "গিফট কম্বো ও হ্যাম্পার", "Gift+Combos"],
-    ["flowers", "ফুল ও বুকেট", "Flowers"],
-    ["chocolates", "চকলেট ও মিষ্টির উপহার", "Chocolates"],
-    ["clothing", "পোশাক ও কাপল সেট", "Clothing"],
-    ["party-decorations", "পার্টি ও অনুষ্ঠানের সাজসজ্জা", "Party+Decorations"],
-    ["islamic", "ইসলামিক ও নিকাহ উপহার", "Islamic+Gifts"],
-    ["romantic-gifts", "টেডি বেয়ার ও রোমান্টিক গিফট", "Romantic+Gifts"],
-    ["others", "অন্যান্য (Others)", "Other+Gifts"],
-  ];
-
-  const DEFAULT_OCCASIONS = [
-    ["birthday", "জন্মদিন", "Birthday"],
-    ["anniversary", "বিবাহবার্ষিকী", "Anniversary"],
-    ["wedding-nikah", "বিয়ে ও নিকাহ", "Wedding+Nikah"],
-    ["love-romance", "ভালোবাসা ও রোমান্স", "Love+Romance"],
-    ["islamic", "ইসলামিক উপলক্ষ", "Islamic+Occasions"],
-    ["parents-day", "বাবা-মা দিবস", "Parents+Day"],
-    ["congratulations", "অভিনন্দন ও অর্জন", "Congratulations"],
-    ["surprise", "সারপ্রাইজ ও বিশেষ মুহূর্ত", "Surprise"],
+    [
+      "photo-frames",
+      "ফটো ফ্রেম ও স্মৃতির উপহার",
+      "Photo+Frames",
+      [
+        "ফটো",
+        "ছবি",
+        "ফ্রেম",
+        "ফটোফ্রেম",
+        "photo",
+        "photo frame",
+        "foto",
+        "fotoframe",
+        "picture",
+        "frame",
+      ],
+    ],
+    [
+      "magic-mirror-led",
+      "ম্যাজিক মিরর ও LED গিফট",
+      "Magic+Mirror",
+      [
+        "ম্যাজিক",
+        "মিরর",
+        "আয়না",
+        "এলইডি",
+        "magic mirror",
+        "mirror",
+        "led",
+        "ayna",
+        "magic",
+        "light",
+      ],
+    ],
+    [
+      "personalized",
+      "কাস্টমাইজড ও পার্সোনালাইজড গিফট",
+      "Personalized+Gifts",
+      [
+        "কাস্টম",
+        "কাস্টমাইজড",
+        "পার্সোনালাইজড",
+        "custom",
+        "customized",
+        "customizable",
+        "personalized",
+        "personalised",
+      ],
+    ],
+    [
+      "gift-combos",
+      "গিফট কম্বো ও হ্যাম্পার",
+      "Gift+Combos",
+      [
+        "গিফট",
+        "কম্বো",
+        "হ্যাম্পার",
+        "গিফট বক্স",
+        "gift",
+        "combo",
+        "hamper",
+        "gift box",
+        "gift set",
+      ],
+    ],
+    [
+      "flowers",
+      "ফুল ও বুকেট",
+      "Flowers",
+      [
+        "ফুল",
+        "বুকেট",
+        "ফুলের তোড়া",
+        "গোলাপ",
+        "flower",
+        "flowers",
+        "bouquet",
+        "ful",
+        "phul",
+        "golap",
+        "rose",
+      ],
+    ],
+    [
+      "chocolates",
+      "চকলেট ও মিষ্টির উপহার",
+      "Chocolates",
+      [
+        "চকলেট",
+        "মিষ্টি",
+        "চকলেট বক্স",
+        "chocolate",
+        "chocolates",
+        "choklet",
+        "sweet",
+        "candy",
+      ],
+    ],
+    [
+      "clothing",
+      "পোশাক ও কাপল সেট",
+      "Clothing",
+      [
+        "পোশাক",
+        "শাড়ি",
+        "পাঞ্জাবি",
+        "শার্ট",
+        "কাপল",
+        "clothing",
+        "dress",
+        "saree",
+        "panjabi",
+        "shirt",
+        "couple",
+        "kapor",
+      ],
+    ],
+    [
+      "party-decorations",
+      "পার্টি ও অনুষ্ঠানের সাজসজ্জা",
+      "Party+Decorations",
+      [
+        "পার্টি",
+        "সাজসজ্জা",
+        "ডেকোরেশন",
+        "party",
+        "decoration",
+        "decor",
+        "birthday decoration",
+        "balloon",
+      ],
+    ],
+    [
+      "islamic",
+      "ইসলামিক ও নিকাহ উপহার",
+      "Islamic+Gifts",
+      [
+        "ইসলামিক",
+        "ইসলামী",
+        "নিকাহ",
+        "নিকাহনামা",
+        "islamic",
+        "islami",
+        "nikah",
+        "nikahnama",
+        "muslim",
+      ],
+    ],
+    [
+      "romantic-gifts",
+      "টেডি বেয়ার ও রোমান্টিক গিফট",
+      "Romantic+Gifts",
+      [
+        "টেডি",
+        "ভালোবাসা",
+        "প্রেম",
+        "রোমান্টিক",
+        "teddy",
+        "bear",
+        "romantic",
+        "love",
+        "couple",
+        "valobasha",
+      ],
+    ],
+    [
+      "others",
+      "অন্যান্য (Others)",
+      "Other+Gifts",
+      [
+        "অন্যান্য",
+        "উপহার",
+        "বিবিধ",
+        "others",
+        "other",
+        "misc",
+        "gift",
+        "upohar",
+      ],
+    ],
   ];
 
   // ==========================================
-  // SEED CATEGORIES & OCCASIONS
+  // DEFAULT OCCASIONS
+  // ==========================================
+
+  const DEFAULT_OCCASIONS = [
+    [
+      "birthday",
+      "জন্মদিন",
+      "Birthday",
+      ["জন্মদিন", "birthday", "birth day", "jonmodin", "jonmo din", "bday"],
+    ],
+    [
+      "anniversary",
+      "বিবাহবার্ষিকী",
+      "Anniversary",
+      [
+        "বিবাহবার্ষিকী",
+        "বার্ষিকী",
+        "anniversary",
+        "wedding anniversary",
+        "bibaho barsiki",
+        "barsiki",
+      ],
+    ],
+    [
+      "wedding-nikah",
+      "বিয়ে ও নিকাহ",
+      "Wedding+Nikah",
+      [
+        "বিয়ে",
+        "বিবাহ",
+        "নিকাহ",
+        "wedding",
+        "marriage",
+        "nikah",
+        "biye",
+        "biya",
+        "nikahnama",
+      ],
+    ],
+    [
+      "love-romance",
+      "ভালোবাসা ও রোমান্স",
+      "Love+Romance",
+      [
+        "ভালোবাসা",
+        "প্রেম",
+        "রোমান্স",
+        "love",
+        "romance",
+        "romantic",
+        "valobasha",
+        "bhalobasha",
+        "prem",
+      ],
+    ],
+    [
+      "islamic",
+      "ইসলামিক উপলক্ষ",
+      "Islamic+Occasions",
+      [
+        "ইসলামিক",
+        "ইসলামী",
+        "রমজান",
+        "ঈদ",
+        "islamic",
+        "islami",
+        "ramadan",
+        "eid",
+        "nikah",
+      ],
+    ],
+    [
+      "parents-day",
+      "বাবা-মা দিবস",
+      "Parents+Day",
+      [
+        "বাবা",
+        "মা",
+        "মায়ের দিন",
+        "বাবার দিন",
+        "mother",
+        "father",
+        "parents",
+        "mother day",
+        "father day",
+        "ma",
+        "baba",
+      ],
+    ],
+    [
+      "congratulations",
+      "অভিনন্দন ও অর্জন",
+      "Congratulations",
+      [
+        "অভিনন্দন",
+        "অর্জন",
+        "সফলতা",
+        "congratulations",
+        "congrats",
+        "achievement",
+        "success",
+        "graduation",
+        "obhinondon",
+      ],
+    ],
+    [
+      "surprise",
+      "সারপ্রাইজ ও বিশেষ মুহূর্ত",
+      "Surprise",
+      [
+        "সারপ্রাইজ",
+        "চমক",
+        "বিশেষ",
+        "surprise",
+        "surprize",
+        "special",
+        "special moment",
+      ],
+    ],
+  ];
+
+  // ==========================================
+  // SEED TAXONOMY FUNCTION
   // ==========================================
 
   const seedTaxonomy = async (collection, entries) => {
     if (!entries.length) return;
 
-    await collection.bulkWrite(
-      entries.flatMap(([id, name, imageText], index) => {
+    const operations = entries.flatMap(
+      ([id, name, imageText, searchKeywords], index) => {
         const imageUrl = `https://placehold.co/800x600/F8F5FA/310039/png?text=${imageText}`;
 
         return [
+          // Insert a new document if missing.
           {
             updateOne: {
               filter: { id },
-
               update: {
                 $setOnInsert: {
                   id,
                   name,
                   imageUrl,
+                  iconUrl: "",
+                  searchKeywords,
                   sortOrder: index + 1,
                 },
               },
-
               upsert: true,
             },
           },
+
+          // Fill missing images only.
           {
             updateOne: {
               filter: {
                 id,
-
                 $or: [
                   { imageUrl: { $exists: false } },
-                  { imageUrl: "" },
                   { imageUrl: null },
+                  { imageUrl: "" },
                 ],
               },
-
               update: {
                 $set: { imageUrl },
               },
             },
           },
+
+          // Fill missing keywords only.
+          {
+            updateOne: {
+              filter: {
+                id,
+                $or: [
+                  { searchKeywords: { $exists: false } },
+                  { searchKeywords: null },
+                ],
+              },
+              update: {
+                $set: { searchKeywords },
+              },
+            },
+          },
         ];
-      }),
+      },
+    );
+
+    await collection.bulkWrite(operations);
+
+    // Existing documents without iconUrl.
+    await collection.updateMany(
+      { iconUrl: { $exists: false } },
+      { $set: { iconUrl: "" } },
+    );
+
+    // Other manually added documents.
+    await collection.updateMany(
+      { searchKeywords: { $exists: false } },
+      { $set: { searchKeywords: [] } },
     );
   };
+
+  // ==========================================
+  // INITIALIZE CATEGORIES AND OCCASIONS
+  // ==========================================
 
   await Promise.all([
     seedTaxonomy(categories, DEFAULT_CATEGORIES),
     seedTaxonomy(occasions, DEFAULT_OCCASIONS),
   ]);
+
+  console.log("Category and Occasion taxonomy ready");
 
   // ==========================================
   // MONGODB PRODUCT INDEXES
@@ -519,28 +853,45 @@ async function run() {
   );
 
   // ==========================================
-  // PUBLIC CATEGORY API
+  // PUBLIC CATEGORIES API
+  // GET /categories
+  // GET /categories?search=photo
   // ==========================================
 
-  app.get("/categories", async (_req, res) => {
+  app.get("/categories", async (req, res) => {
     try {
-      const result = await categories
-        .find(
-          {},
-          {
-            projection: {
-              _id: 0,
-              id: 1,
-              name: 1,
-            },
+      const search = String(req.query.search || "")
+        .trim()
+        .slice(0, 100);
+
+      const query = {};
+
+      if (search) {
+        const regex = makeSearchRegex(search);
+
+        query.$or = [{ id: regex }, { name: regex }, { searchKeywords: regex }];
+      }
+
+      const categoryList = await categories
+        .find(query, {
+          projection: {
+            _id: 0,
+            id: 1,
+            name: 1,
+            imageUrl: 1,
+            iconUrl: 1,
+            searchKeywords: 1,
+            sortOrder: 1,
           },
-        )
-        .sort({ sortOrder: 1 })
+        })
+        .sort({ sortOrder: 1, id: 1 })
         .toArray();
 
-      return res.send({
+      res.set("Cache-Control", "no-store");
+
+      return res.status(200).send({
         success: true,
-        categories: result,
+        categories: categoryList,
       });
     } catch (error) {
       return respondError(res, error, "Get Categories Error");
@@ -549,27 +900,44 @@ async function run() {
 
   // ==========================================
   // PUBLIC OCCASIONS API
+  // GET /occasions
+  // GET /occasions?search=jonmodin
   // ==========================================
 
-  app.get("/occasions", async (_req, res) => {
+  app.get("/occasions", async (req, res) => {
     try {
-      const result = await occasions
-        .find(
-          {},
-          {
-            projection: {
-              _id: 0,
-              id: 1,
-              name: 1,
-            },
+      const search = String(req.query.search || "")
+        .trim()
+        .slice(0, 100);
+
+      const query = {};
+
+      if (search) {
+        const regex = makeSearchRegex(search);
+
+        query.$or = [{ id: regex }, { name: regex }, { searchKeywords: regex }];
+      }
+
+      const occasionList = await occasions
+        .find(query, {
+          projection: {
+            _id: 0,
+            id: 1,
+            name: 1,
+            imageUrl: 1,
+            iconUrl: 1,
+            searchKeywords: 1,
+            sortOrder: 1,
           },
-        )
-        .sort({ sortOrder: 1 })
+        })
+        .sort({ sortOrder: 1, id: 1 })
         .toArray();
 
-      return res.send({
+      res.set("Cache-Control", "no-store");
+
+      return res.status(200).send({
         success: true,
-        occasions: result,
+        occasions: occasionList,
       });
     } catch (error) {
       return respondError(res, error, "Get Occasions Error");
