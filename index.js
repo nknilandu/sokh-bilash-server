@@ -12,6 +12,8 @@ const {
   makeSearchRegex,
 } = require("./utils/productSearch");
 
+const registerCommerceRoutes = require("./routes/commerce.routes");
+
 //================== middleware =====================
 app.use(express.json());
 app.use(cors());
@@ -76,10 +78,51 @@ async function run() {
   const categories = DB.collection("categories");
   const occasions = DB.collection("occasions");
   const products = DB.collection("products");
+  const carts = DB.collection("carts");
+  const orders = DB.collection("orders");
+
+    // ==========================================
+  // ADMIN MIDDLEWARE
+  // ==========================================
+
+  const verifyAdmin = async (req, res, next) => {
+    try {
+      const admin = await users.findOne(
+        {
+          uid: req.user?.uid,
+          role: "admin",
+          status: "active",
+        },
+        {
+          projection: { _id: 1 },
+        },
+      );
+
+      if (!admin) {
+        return res.status(403).send({
+          success: false,
+          message: "Only active admins can perform this action",
+        });
+      }
+
+      next();
+    } catch (error) {
+      return respondError(res, error, "Verify Admin Error");
+    }
+  };
 
   // ==========================================
   // COMMON HELPERS
   // ==========================================
+
+  await registerCommerceRoutes({
+    app,
+    DB,
+    users,
+    products,
+    verifyFirebaseToken,
+    verifyAdmin,
+  });
 
   const respondError = (res, error, label) => {
     console.error(`${label}:`, error);
@@ -138,35 +181,7 @@ async function run() {
   const parsePage = (value) =>
     Math.min(10000, Math.max(1, Number.parseInt(value, 10) || 1));
 
-  // ==========================================
-  // ADMIN MIDDLEWARE
-  // ==========================================
 
-  const verifyAdmin = async (req, res, next) => {
-    try {
-      const admin = await users.findOne(
-        {
-          uid: req.user?.uid,
-          role: "admin",
-          status: "active",
-        },
-        {
-          projection: { _id: 1 },
-        },
-      );
-
-      if (!admin) {
-        return res.status(403).send({
-          success: false,
-          message: "Only active admins can perform this action",
-        });
-      }
-
-      next();
-    } catch (error) {
-      return respondError(res, error, "Verify Admin Error");
-    }
-  };
 
   // ==========================================
   // MULTILINGUAL SEARCH HELPERS
