@@ -2571,6 +2571,26 @@ app.get("/", (req, res) => {
   res.send("Successfully connected to SokhBilash");
 });
 
-app.listen(port, () => {
-  console.log(`Example app listening on port ${port}`);
+// Initialize MongoDB and register all routes
+routesReady = run();
+
+// Log initialization failures
+routesReady.catch((error) => {
+  console.error("Server initialization failed:", error);
 });
+
+// Export Express app for Vercel
+module.exports = app;
+
+// Start HTTP server only when running locally
+if (require.main === module) {
+  routesReady
+    .then(() => {
+      app.listen(port, () => {
+        console.log(`SokhBilash API running on port ${port}`);
+      });
+    })
+    .catch(() => {
+      process.exitCode = 1;
+    });
+}
