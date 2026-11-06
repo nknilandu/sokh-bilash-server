@@ -87,7 +87,7 @@ async function run() {
   // Register API routes on the dedicated router, not the outer app.
   const app = apiRouter;
 
-  await client.connect();
+  // await client.connect();
 
   const DB = client.db("sokhBilash");
   const users = DB.collection("users");
