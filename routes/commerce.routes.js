@@ -2687,9 +2687,629 @@ module.exports = async function registerCommerceRoutes({
     }),
   ];
 
-  app.get("/admin/orders", ...listAdmin("orders"));
+  // ==========================================
+  // ADMIN ORDERS LIST
+  // Guest + Customer
+  // Search, Filter, Pagination, Global Stats
+  // ==========================================
 
-  app.get("/admin/payments", ...listAdmin("payments"));
+  app.get(
+    "/admin/orders",
+    verifyFirebaseToken,
+    verifyAdmin,
+    handle(async (req, res) => {
+      const page = Math.min(
+        10000,
+        Math.max(1, parseInt(req.query.page, 10) || 1),
+      );
+
+      const perPage = 10;
+
+      const status = str(req.query.status, 30).toLowerCase();
+      const method = str(req.query.method, 20).toLowerCase();
+      const date = str(req.query.date, 20).toLowerCase();
+      const search = str(req.query.search, 100);
+
+      const allowedStatuses = [
+        "all",
+        "pending",
+        "verified",
+        "processing",
+        "shipped",
+        "delivered",
+        "rejected",
+        "cancelled",
+      ];
+
+      const allowedMethods = ["all", "bkash", "nagad", "rocket", "cod"];
+
+      if (status && !allowedStatuses.includes(status)) {
+        fail("Invalid order status");
+      }
+
+      if (method && !allowedMethods.includes(method)) {
+        fail("Invalid payment method");
+      }
+
+      if (date && !["all", "today", "week", "month"].includes(date)) {
+        fail("Invalid date filter");
+      }
+
+      const filter = {};
+
+      if (status && status !== "all") {
+        filter.status = status;
+      }
+
+      if (method && method !== "all") {
+        filter["payment.method"] = method;
+      }
+
+      // ======================================
+      // SEARCH
+      // ======================================
+
+      if (search) {
+        const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+        const rx = new RegExp(escaped, "i");
+
+        filter.$or = [
+          { orderNumber: rx },
+          { "customer.name": rx },
+          { "customer.phone": rx },
+          { "customer.email": rx },
+          { "shipping.phone": rx },
+          { "items.name": rx },
+          { "items.sku": rx },
+          { "payment.trxId": rx },
+        ];
+
+        if (/^[a-f0-9]{24}$/i.test(search)) {
+          filter.$or.push({
+            _id: new ObjectId(search),
+          });
+        }
+      }
+
+      // ======================================
+      // DATE — DHAKA TIMEZONE
+      // ======================================
+
+      if (date && date !== "all") {
+        const now = new Date();
+        const offset = 6 * 60 * 60 * 1000;
+
+        const dhaka = new Date(now.getTime() + offset);
+
+        const year = dhaka.getUTCFullYear();
+        const month = dhaka.getUTCMonth();
+        const day = dhaka.getUTCDate();
+
+        const today = new Date(Date.UTC(year, month, day) - offset);
+
+        let start;
+
+        if (date === "today") {
+          start = today;
+        } else if (date === "week") {
+          start = new Date(today.getTime() - 6 * 86400000);
+        } else {
+          start = new Date(Date.UTC(year, month, 1) - offset);
+        }
+
+        filter.createdAt = {
+          $gte: start,
+          $lte: now,
+        };
+      }
+
+      // ======================================
+      // GLOBAL STATS
+      // Not limited to current page
+      // ======================================
+
+      const [documents, filteredTotal, statusRows, custom] = await Promise.all([
+        orders
+          .find(filter, {
+            projection: {
+              checkoutId: 0,
+              guestTokenHash: 0,
+              paymentTrxIds: 0,
+            },
+          })
+          .sort({
+            createdAt: -1,
+            _id: -1,
+          })
+          .skip((page - 1) * perPage)
+          .limit(perPage)
+          .toArray(),
+
+        orders.countDocuments(filter),
+
+        orders
+          .aggregate([
+            {
+              $group: {
+                _id: "$status",
+                count: { $sum: 1 },
+              },
+            },
+          ])
+          .toArray(),
+
+        orders.countDocuments({
+          status: {
+            $in: ["verified", "processing"],
+          },
+          "items.customization.mode": {
+            $in: ["frame", "note"],
+          },
+        }),
+      ]);
+
+      const counts = {
+        all: 0,
+        pending: 0,
+        verified: 0,
+        processing: 0,
+        shipped: 0,
+        delivered: 0,
+        rejected: 0,
+        cancelled: 0,
+      };
+
+      for (const item of statusRows) {
+        counts[item._id] = item.count;
+        counts.all += item.count;
+      }
+
+      const stats = {
+        total: counts.all,
+
+        active:
+          (counts.pending || 0) +
+          (counts.verified || 0) +
+          (counts.processing || 0) +
+          (counts.shipped || 0),
+
+        pending: counts.pending || 0,
+        custom,
+        transit: counts.shipped || 0,
+      };
+
+      // ========================================
+      // LOAD CUSTOMER PROFILE PHOTOS
+      // ========================================
+
+      const customerUids = [
+        ...new Set(
+          documents
+            .filter((order) => !order.guest && order.uid)
+            .map((order) => order.uid),
+        ),
+      ];
+
+      // Uses existing MongoDB users collection.
+      const customerAccounts = customerUids.length
+        ? await users
+            .find(
+              {
+                uid: { $in: customerUids },
+              },
+              {
+                projection: {
+                  uid: 1,
+                  photoUrl: 1,
+                  photoURL: 1,
+                  imageUrl: 1,
+                  image_url: 1,
+                },
+              },
+            )
+            .toArray()
+        : [];
+
+      const customerPhotoMap = new Map(
+        customerAccounts.map((account) => [
+          account.uid,
+          account.photoUrl ||
+            account.photoURL ||
+            account.imageUrl ||
+            account.image_url ||
+            "",
+        ]),
+      );
+
+      res.set("Cache-Control", "no-store");
+
+      return res.json({
+        success: true,
+
+        orders: documents.map((order) => {
+          const { uid, ...orderData } = order;
+
+          const items = Array.isArray(order.items) ? order.items : [];
+
+          const itemCount = items.reduce(
+            (total, item) => total + (Number(item.quantity) || 0),
+            0,
+          );
+
+          return {
+            ...orderData,
+
+            _id: order._id.toString(),
+
+            customerPhotoUrl: order.guest
+              ? ""
+              : customerPhotoMap.get(uid) || "",
+
+            itemCount,
+          };
+        }),
+
+        stats,
+        counts,
+
+        pagination: {
+          page,
+          limit: perPage,
+          total: filteredTotal,
+          totalPages: Math.max(1, Math.ceil(filteredTotal / perPage)),
+          hasNextPage: page * perPage < filteredTotal,
+          hasPreviousPage: page > 1,
+        },
+      });
+    }),
+  );
+
+  // ==========================================
+  // ADMIN PAYMENT LIST
+  // Guest + Registered Customer
+  // Search + Filters + Stats + Pagination
+  // ==========================================
+
+  app.get(
+    "/admin/payments",
+    verifyFirebaseToken,
+    verifyAdmin,
+    handle(async (req, res) => {
+      const page = Math.min(
+        10000,
+        Math.max(1, parseInt(req.query.page, 10) || 1),
+      );
+
+      const limit = 10;
+
+      const status = str(req.query.status, 30).toLowerCase();
+      const method = str(req.query.method, 20).toLowerCase();
+      const date = str(req.query.date, 20).toLowerCase();
+      const search = str(req.query.search, 100);
+
+      const statuses = [
+        "",
+        "all",
+        "pending",
+        "partially_paid",
+        "verified",
+        "rejected",
+      ];
+
+      const methods = ["", "all", "bkash", "nagad", "rocket"];
+
+      const dates = ["", "all", "today", "week", "month"];
+
+      if (!statuses.includes(status)) {
+        fail("Invalid payment status");
+      }
+
+      if (!methods.includes(method)) {
+        fail("Invalid payment method");
+      }
+
+      if (!dates.includes(date)) {
+        fail("Invalid date filter");
+      }
+
+      // COD is managed separately.
+      // Never count COD as verified online payment.
+      const onlineFilter = {
+        "payment.method": {
+          $in: ["bkash", "nagad", "rocket"],
+        },
+      };
+
+      const filter = { ...onlineFilter };
+
+      // ======================================
+      // PAYMENT STATUS
+      // ======================================
+
+      if (status === "pending") {
+        filter["payment.status"] = {
+          $in: ["pending", "partially_paid"],
+        };
+      } else if (status && status !== "all") {
+        filter["payment.status"] = status;
+      }
+
+      // ======================================
+      // PAYMENT METHOD
+      // ======================================
+
+      if (method && method !== "all") {
+        filter["payment.method"] = method;
+      }
+
+      // ======================================
+      // SEARCH
+      // ======================================
+
+      if (search) {
+        const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+        const regex = new RegExp(escaped, "i");
+
+        const searchConditions = [
+          { orderNumber: regex },
+          { "customer.name": regex },
+          { "customer.phone": regex },
+          { "customer.email": regex },
+          { "payment.senderPhone": regex },
+          { "payment.trxId": regex },
+        ];
+
+        if (/^[a-f0-9]{24}$/i.test(search)) {
+          searchConditions.push({
+            _id: new ObjectId(search),
+          });
+        }
+
+        filter.$or = searchConditions;
+      }
+
+      // ======================================
+      // DATE FILTER — ASIA/DHAKA UTC+06
+      // ======================================
+
+      if (date && date !== "all") {
+        const dhakaNow = new Date(Date.now() + 6 * 60 * 60 * 1000);
+
+        const year = dhakaNow.getUTCFullYear();
+        const month = dhakaNow.getUTCMonth();
+        const day = dhakaNow.getUTCDate();
+
+        const todayStart = new Date(
+          Date.UTC(year, month, day) - 6 * 60 * 60 * 1000,
+        );
+
+        let start;
+
+        if (date === "today") {
+          start = todayStart;
+        } else if (date === "week") {
+          start = new Date(todayStart.getTime() - 6 * 24 * 60 * 60 * 1000);
+        } else {
+          start = new Date(Date.UTC(year, month, 1) - 6 * 60 * 60 * 1000);
+        }
+
+        filter.createdAt = {
+          $gte: start,
+          $lte: new Date(),
+        };
+      }
+
+      // ======================================
+      // GLOBAL STATS
+      // Independent of table filters
+      // ======================================
+
+      const statsPipeline = [
+        { $match: onlineFilter },
+
+        {
+          $group: {
+            _id: null,
+
+            total: { $sum: 1 },
+
+            pending: {
+              $sum: {
+                $cond: [
+                  {
+                    $in: ["$payment.status", ["pending", "partially_paid"]],
+                  },
+                  1,
+                  0,
+                ],
+              },
+            },
+
+            partiallyPaid: {
+              $sum: {
+                $cond: [
+                  {
+                    $eq: ["$payment.status", "partially_paid"],
+                  },
+                  1,
+                  0,
+                ],
+              },
+            },
+
+            verified: {
+              $sum: {
+                $cond: [
+                  {
+                    $eq: ["$payment.status", "verified"],
+                  },
+                  1,
+                  0,
+                ],
+              },
+            },
+
+            rejected: {
+              $sum: {
+                $cond: [
+                  {
+                    $eq: ["$payment.status", "rejected"],
+                  },
+                  1,
+                  0,
+                ],
+              },
+            },
+
+            verifiedCollection: {
+              $sum: {
+                $ifNull: ["$payment.verifiedAmount", 0],
+              },
+            },
+          },
+        },
+      ];
+
+      // ======================================
+      // FETCH TABLE + TOTAL + STATS
+      // ======================================
+
+      const [documents, total, statsResult] = await Promise.all([
+        orders
+          .find(filter, {
+            projection: {
+              orderNumber: 1,
+              guest: 1,
+              customer: 1,
+              payment: 1,
+              total: 1,
+              status: 1,
+              createdAt: 1,
+              updatedAt: 1,
+
+              uid: 1,
+
+              "items.name": 1,
+              "items.image": 1,
+              "items.quantity": 1,
+              "items.variantTitle": 1,
+            },
+          })
+          .sort({
+            createdAt: -1,
+            _id: -1,
+          })
+          .skip((page - 1) * limit)
+          .limit(limit)
+          .toArray(),
+
+        orders.countDocuments(filter),
+
+        orders.aggregate(statsPipeline).toArray(),
+      ]);
+
+      const stats = statsResult[0] || {
+        total: 0,
+        pending: 0,
+        partiallyPaid: 0,
+        verified: 0,
+        rejected: 0,
+        verifiedCollection: 0,
+      };
+
+      // ========================================
+      // LOAD CUSTOMER PROFILE IMAGES
+      // ========================================
+
+      const customerUids = [
+        ...new Set(
+          documents
+            .filter((order) => !order.guest && order.uid)
+            .map((order) => order.uid),
+        ),
+      ];
+
+      const customerAccounts = customerUids.length
+        ? await users
+            .find(
+              {
+                uid: { $in: customerUids },
+              },
+              {
+                projection: {
+                  uid: 1,
+                  photoUrl: 1,
+                  photoURL: 1,
+                  imageUrl: 1,
+                  image_url: 1,
+                },
+              },
+            )
+            .toArray()
+        : [];
+
+      const customerPhotoMap = new Map(
+        customerAccounts.map((account) => [
+          account.uid,
+
+          account.photoUrl ||
+            account.photoURL ||
+            account.imageUrl ||
+            account.image_url ||
+            "",
+        ]),
+      );
+
+      res.set("Cache-Control", "no-store");
+
+      return res.json({
+        success: true,
+
+        payments: documents.map(({ uid, ...order }) => {
+          const items = Array.isArray(order.items) ? order.items : [];
+
+          const itemCount = items.reduce(
+            (total, item) => total + (Number(item.quantity) || 0),
+            0,
+          );
+
+          return {
+            ...order,
+
+            _id: order._id.toString(),
+
+            // Registered Customer profile photo.
+            // Guest => no photo, icon fallback.
+            customerPhotoUrl: customerPhotoMap.get(uid) || "",
+
+            // Total product quantity
+            itemCount,
+
+            // Maximum two preview images
+            items: items.slice(0, 2),
+          };
+        }),
+
+        stats: {
+          total: stats.total,
+          pending: stats.pending,
+          partiallyPaid: stats.partiallyPaid,
+          verified: stats.verified,
+          rejected: stats.rejected,
+          verifiedCollection: stats.verifiedCollection,
+        },
+
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.max(1, Math.ceil(total / limit)),
+        },
+      });
+    }),
+  );
 
   // =========================================
   // GET /admin/orders/:identifier
@@ -2706,50 +3326,158 @@ module.exports = async function registerCommerceRoutes({
         fail("Order not found", 404);
       }
 
+      let customerPhotoUrl = "";
+
+      if (!order.guest && order.uid) {
+        const account = await users.findOne(
+          { uid: order.uid },
+          {
+            projection: {
+              photoUrl: 1,
+              photoURL: 1,
+              imageUrl: 1,
+              image_url: 1,
+            },
+          },
+        );
+
+        customerPhotoUrl =
+          account?.photoUrl ||
+          account?.photoURL ||
+          account?.imageUrl ||
+          account?.image_url ||
+          "";
+      }
+
       res.set("Cache-Control", "no-store");
 
-      res.json({
+      return res.json({
         success: true,
 
-        order: viewOrder(order),
+        order: {
+          ...viewOrder(order),
+
+          customerPhotoUrl,
+
+          // Only returned by admin endpoint.
+          internalNotes: order.internalNotes || [],
+        },
       });
     }),
   );
 
-  // =========================================
-  // ADMIN PAYMENT VERIFICATION
-  // =========================================
+  // ==========================================
+  // ADMIN INTERNAL NOTES
+  // POST /admin/orders/:identifier/notes
+  // ==========================================
 
-  app.patch(
-    "/admin/orders/:identifier/payment",
+  app.post(
+    "/admin/orders/:identifier/notes",
     verifyFirebaseToken,
     verifyAdmin,
     handle(async (req, res) => {
-      const decision = str(req.body.decision, 20);
+      const text = str(req.body?.text, 1000);
 
-      if (!["verify", "reject"].includes(decision)) {
-        fail("Invalid decision");
+      if (!text) {
+        fail("Note cannot be empty");
       }
 
       const updated = await updateOrder(
         req.params.identifier,
 
         (order) => {
-          if (order.payment.method === "cod") {
+          const previous = Array.isArray(order.internalNotes)
+            ? order.internalNotes
+            : [];
+
+          const newNote = {
+            id: randomUUID(),
+
+            author: req.user.name || req.user.email || "SokhBilash Admin",
+
+            uid: req.user.uid,
+
+            text,
+
+            createdAt: new Date(),
+          };
+
+          return {
+            set: {
+              internalNotes: [...previous.slice(-99), newNote],
+            },
+
+            event: "internal_note_added",
+
+            // Do not expose the note content
+            // through public order history.
+            note: "Admin-only note added",
+
+            by: req.user.uid,
+          };
+        },
+      );
+
+      res.set("Cache-Control", "no-store");
+
+      return res.status(201).json({
+        success: true,
+        message: "Internal note saved",
+
+        order: {
+          ...viewOrder(updated),
+          internalNotes: updated.internalNotes || [],
+        },
+      });
+    }),
+  );
+
+  // ==========================================
+  // ADMIN PAYMENT VERIFY / REJECT
+  // Secure cumulative reconciliation
+  // ==========================================
+
+  app.patch(
+    "/admin/orders/:identifier/payment",
+    verifyFirebaseToken,
+    verifyAdmin,
+    handle(async (req, res) => {
+      const decision = str(req.body?.decision, 20).toLowerCase();
+
+      if (!["verify", "reject"].includes(decision)) {
+        fail("Invalid payment decision");
+      }
+
+      const updated = await updateOrder(
+        req.params.identifier,
+
+        (order) => {
+          const payment = order.payment || {};
+
+          if (payment.method === "cod") {
             fail("Use phone confirmation for COD", 409);
           }
 
-          if (
-            order.status !== "pending" ||
-            !["pending", "partially_paid"].includes(order.payment.status)
-          ) {
-            fail("Payment is not pending verification", 409);
+          // Only a new pending proof can be
+          // verified or rejected.
+          // A partially reviewed proof cannot
+          // be credited twice.
+
+          if (order.status !== "pending" || payment.status !== "pending") {
+            fail(
+              "This payment proof is already reviewed or is not pending",
+              409,
+            );
           }
 
+          const previous = currency(payment.verifiedAmount || 0);
+
+          // ==================================
           // REJECT
+          // ==================================
 
           if (decision === "reject") {
-            const reason = str(req.body.reason, 500);
+            const reason = str(req.body?.reason, 500);
 
             if (!reason) {
               fail("Rejection reason required");
@@ -2760,73 +3488,75 @@ module.exports = async function registerCommerceRoutes({
                 status: "rejected",
 
                 payment: {
-                  ...order.payment,
-
+                  ...payment,
                   status: "rejected",
-
                   rejectedReason: reason,
-
                   verifiedBy: req.user.uid,
-
                   verifiedAt: new Date(),
+
+                  // Previously verified money
+                  // must not disappear.
+                  verifiedAmount: previous,
+                  dueAmount: currency(order.total - previous),
                 },
               },
 
               event: "payment_rejected",
-
               note: reason,
-
               by: req.user.uid,
             };
           }
 
+          // ==================================
           // VERIFY
-          // verifiedAmount is cumulative.
+          // verifiedAmount is CUMULATIVE.
+          // ==================================
 
           const amount = parseAmount(
-            req.body.verifiedAmount,
+            req.body?.verifiedAmount,
             "verified amount",
           );
 
-          const previouslyVerified = currency(
-            order.payment.verifiedAmount || 0,
-          );
+          const receivedForThisProof = currency(amount - previous);
 
-          if (amount < previouslyVerified) {
-            fail("Verified amount cannot decrease", 409);
+          const claim = currency(payment.claimedAmount || 0);
+
+          const remaining = currency(order.total - previous);
+
+          if (receivedForThisProof <= 0) {
+            fail("Verified amount must increase", 409);
           }
 
-          if (amount > order.total) {
-            fail("Amount exceeds order total");
+          if (receivedForThisProof > claim) {
+            fail("Actual received amount exceeds submitted claim");
           }
 
-          if (
-            amount >
-            currency(previouslyVerified + (order.payment.claimedAmount || 0))
-          ) {
-            fail("Amount exceeds customer-submitted payment claim");
+          if (receivedForThisProof > remaining) {
+            fail("Received amount exceeds remaining due");
           }
 
-          const fullyPaid = amount >= currency(order.total);
+          const due = currency(order.total - amount);
+
+          const fullyPaid = due <= 0;
 
           return {
             set: {
               status: fullyPaid ? "verified" : "pending",
 
               payment: {
-                ...order.payment,
+                ...payment,
 
                 status: fullyPaid ? "verified" : "partially_paid",
 
                 verifiedAmount: amount,
-
-                dueAmount: currency(order.total - amount),
+                dueAmount: due,
 
                 verifiedAt: new Date(),
-
                 verifiedBy: req.user.uid,
-
                 rejectedReason: null,
+
+                // Audit which proof was reviewed.
+                reviewedTrxId: payment.trxId,
               },
             },
 
@@ -2834,18 +3564,21 @@ module.exports = async function registerCommerceRoutes({
               ? "payment_verified"
               : "payment_partially_verified",
 
-            note: `Verified BDT ${amount}`,
+            note:
+              `Received BDT ${receivedForThisProof}; ` +
+              `Cumulative BDT ${amount}; ` +
+              `Due BDT ${due}`,
 
             by: req.user.uid,
           };
         },
       );
 
-      res.json({
+      res.set("Cache-Control", "no-store");
+
+      return res.json({
         success: true,
-
-        message: "Payment updated",
-
+        message: "Payment updated successfully",
         order: viewOrder(updated),
       });
     }),
@@ -2981,60 +3714,1910 @@ module.exports = async function registerCommerceRoutes({
     verifyFirebaseToken,
     verifyAdmin,
     handle(async (req, res) => {
-      const name = str(req.body.name, 150);
+      const name = str(req.body?.name, 150);
 
-      const trackingNumber = str(req.body.trackingNumber, 150);
+      const trackingNumber = str(req.body?.trackingNumber, 150);
 
-      const trackingUrl = str(req.body.trackingUrl, 2048);
+      const trackingUrl = str(req.body?.trackingUrl, 2048);
+
+      const parcelWeight = str(req.body?.parcelWeight, 30);
+
+      // ====================================
+      // VALIDATION
+      // ====================================
+
+      if (!name && (trackingNumber || trackingUrl || parcelWeight)) {
+        fail(
+          "Courier name is required when tracking or parcel details are provided",
+        );
+      }
+
+      if (trackingUrl && !trackingNumber) {
+        fail("Tracking number required for tracking URL");
+      }
 
       if (trackingUrl && !validHttpsUrl(trackingUrl)) {
-        fail("Invalid tracking URL");
+        fail("Invalid HTTPS tracking URL");
       }
 
-      const date = req.body.estimatedDelivery || null;
-
-      if (date && Number.isNaN(Date.parse(date))) {
-        fail("Invalid estimated delivery date");
+      if (
+        parcelWeight &&
+        !/^\d{1,4}(?:\.\d{1,2})?\s*(?:kg|g)$/i.test(parcelWeight)
+      ) {
+        fail("Invalid parcel weight. Example: 1.5 kg or 500 g");
       }
+
+      // Keep compatibility with the existing
+      // Order Management tracking form.
+      // If date is not supplied, do not touch it.
+
+      const dateProvided = Object.prototype.hasOwnProperty.call(
+        req.body || {},
+        "estimatedDelivery",
+      );
+
+      let estimatedDelivery = null;
+
+      if (dateProvided) {
+        const rawDate = req.body.estimatedDelivery;
+
+        if (rawDate !== null && rawDate !== "") {
+          if (
+            typeof rawDate !== "string" ||
+            Number.isNaN(Date.parse(rawDate))
+          ) {
+            fail("Invalid estimated delivery date");
+          }
+
+          estimatedDelivery = new Date(rawDate);
+        }
+      }
+
+      // ====================================
+      // ATOMIC ORDER UPDATE
+      // ====================================
 
       const updated = await updateOrder(
         req.params.identifier,
 
         (order) => {
           if (["rejected", "cancelled"].includes(order.status)) {
-            fail("Inactive order", 409);
+            fail("Cannot edit an inactive order", 409);
           }
 
           return {
             set: {
               courier: {
+                ...order.courier,
+
                 name: name || null,
 
                 trackingNumber: trackingNumber || null,
 
                 trackingUrl: trackingUrl || null,
+
+                parcelWeight: parcelWeight || null,
               },
 
-              estimatedDelivery: date ? new Date(date) : null,
+              // Only change the date when the
+              // client explicitly supplies it.
+              ...(dateProvided ? { estimatedDelivery } : {}),
             },
 
             event: "tracking_updated",
 
-            note: trackingNumber
-              ? `Tracking: ${trackingNumber}`
-              : "Courier updated",
+            note:
+              `Courier: ${name || "Unassigned"}; ` +
+              `Tracking: ${trackingNumber || "None"}; ` +
+              `Weight: ${parcelWeight || "None"}`,
 
             by: req.user.uid,
           };
         },
       );
 
-      res.json({
-        success: true,
+      res.set("Cache-Control", "no-store");
 
-        message: "Tracking updated",
+      return res.json({
+        success: true,
+        message: "Courier details updated",
 
         order: viewOrder(updated),
+      });
+    }),
+  );
+
+  // ================================================
+  // ADMIN DASHBOARD - FULL DYNAMIC API
+  // GET /admin/dashboard
+  // ================================================
+
+  app.get(
+    "/admin/dashboard",
+    verifyFirebaseToken,
+    verifyAdmin,
+    handle(async (req, res) => {
+      // ==========================================
+      // DHAKA TIMEZONE
+      // ==========================================
+
+      const now = new Date();
+      const DAY_MS = 24 * 60 * 60 * 1000;
+      const DHAKA_OFFSET_MS = 6 * 60 * 60 * 1000;
+
+      const dhakaNow = new Date(now.getTime() + DHAKA_OFFSET_MS);
+
+      const year = dhakaNow.getUTCFullYear();
+      const month = dhakaNow.getUTCMonth();
+      const day = dhakaNow.getUTCDate();
+
+      const todayCalendar = Date.UTC(year, month, day);
+
+      const todayStart = new Date(todayCalendar - DHAKA_OFFSET_MS);
+
+      const currentMonthStart = new Date(
+        Date.UTC(year, month, 1) - DHAKA_OFFSET_MS,
+      );
+
+      const sixMonthStart = new Date(
+        Date.UTC(year, month - 5, 1) - DHAKA_OFFSET_MS,
+      );
+
+      const current30Start = new Date(todayStart.getTime() - 29 * DAY_MS);
+
+      const previous30Start = new Date(current30Start.getTime() - 30 * DAY_MS);
+
+      const dayAt = (offset) => new Date(todayCalendar + offset * DAY_MS);
+
+      const dateKey = (date) => date.toISOString().slice(0, 10);
+
+      const roundMoney = (value) =>
+        Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
+
+      const percentChange = (current, previous) => {
+        if (!previous) return null;
+
+        return Math.round(((current - previous) / previous) * 1000) / 10;
+      };
+
+      // ==========================================
+      // BUSINESS CONFIGURATION
+      // ==========================================
+
+      const activeStatuses = ["pending", "verified", "processing", "shipped"];
+
+      const onlineMethods = ["bkash", "nagad", "rocket"];
+
+      const customProductCondition = {
+        $gt: [
+          {
+            $size: {
+              $filter: {
+                input: {
+                  $ifNull: ["$items", []],
+                },
+                as: "item",
+                cond: {
+                  $in: ["$$item.customization.mode", ["frame", "note"]],
+                },
+              },
+            },
+          },
+          0,
+        ],
+      };
+
+      // ==========================================
+      // 1. DASHBOARD KPI AGGREGATION
+      // ==========================================
+
+      const overviewPipeline = [
+        {
+          $group: {
+            _id: null,
+
+            // All orders
+            totalOrders: {
+              $sum: 1,
+            },
+
+            // Pending orders
+            pendingOrders: {
+              $sum: {
+                $cond: [{ $eq: ["$status", "pending"] }, 1, 0],
+              },
+            },
+
+            // Only unreviewed online payment proofs
+            pendingPayments: {
+              $sum: {
+                $cond: [
+                  {
+                    $and: [
+                      {
+                        $eq: ["$status", "pending"],
+                      },
+                      {
+                        $eq: ["$payment.status", "pending"],
+                      },
+                      {
+                        $in: ["$payment.method", onlineMethods],
+                      },
+                    ],
+                  },
+                  1,
+                  0,
+                ],
+              },
+            },
+
+            // Delivered orders
+            deliveredOrders: {
+              $sum: {
+                $cond: [{ $eq: ["$status", "delivered"] }, 1, 0],
+              },
+            },
+
+            // Total fulfilled sales
+            totalSales: {
+              $sum: {
+                $cond: [
+                  { $eq: ["$status", "delivered"] },
+                  {
+                    $ifNull: ["$total", 0],
+                  },
+                  0,
+                ],
+              },
+            },
+
+            // Outstanding balance on active orders
+            outstandingBalance: {
+              $sum: {
+                $cond: [
+                  {
+                    $in: ["$status", activeStatuses],
+                  },
+                  {
+                    $max: [
+                      0,
+                      {
+                        $subtract: [
+                          {
+                            $ifNull: ["$total", 0],
+                          },
+                          {
+                            $ifNull: ["$payment.verifiedAmount", 0],
+                          },
+                        ],
+                      },
+                    ],
+                  },
+                  0,
+                ],
+              },
+            },
+
+            // COD phone confirmation pending
+            codUnconfirmed: {
+              $sum: {
+                $cond: [
+                  {
+                    $and: [
+                      {
+                        $eq: ["$payment.method", "cod"],
+                      },
+                      {
+                        $eq: ["$status", "pending"],
+                      },
+                      {
+                        $ne: ["$phoneConfirmed", true],
+                      },
+                    ],
+                  },
+                  1,
+                  0,
+                ],
+              },
+            },
+
+            // Custom orders in production
+            customProcessing: {
+              $sum: {
+                $cond: [
+                  {
+                    $and: [
+                      {
+                        $in: ["$status", ["verified", "processing"]],
+                      },
+                      customProductCondition,
+                    ],
+                  },
+                  1,
+                  0,
+                ],
+              },
+            },
+          },
+        },
+      ];
+
+      // ==========================================
+      // 2. CURRENT MONTH ORDER STATUS CHART
+      // ==========================================
+
+      const monthStatusPipeline = [
+        {
+          $match: {
+            createdAt: {
+              $gte: currentMonthStart,
+              $lte: now,
+            },
+          },
+        },
+        {
+          $group: {
+            _id: "$status",
+            count: {
+              $sum: 1,
+            },
+          },
+        },
+      ];
+
+      // ==========================================
+      // 3. SALES TREND
+      // Delivered orders grouped by createdAt
+      // ==========================================
+
+      const salesPipeline = [
+        {
+          $match: {
+            status: "delivered",
+            createdAt: {
+              $gte: sixMonthStart,
+              $lte: now,
+            },
+          },
+        },
+        {
+          $group: {
+            _id: {
+              $dateToString: {
+                format: "%Y-%m-%d",
+                date: "$createdAt",
+                timezone: "Asia/Dhaka",
+              },
+            },
+            sales: {
+              $sum: {
+                $ifNull: ["$total", 0],
+              },
+            },
+          },
+        },
+        {
+          $sort: {
+            _id: 1,
+          },
+        },
+      ];
+
+      // ==========================================
+      // 4. VERIFIED ONLINE PAYMENT COLLECTION
+      // ==========================================
+
+      const paymentPipeline = [
+        {
+          $match: {
+            "payment.method": {
+              $in: onlineMethods,
+            },
+          },
+        },
+        {
+          $group: {
+            _id: "$payment.method",
+            amount: {
+              $sum: {
+                $ifNull: ["$payment.verifiedAmount", 0],
+              },
+            },
+          },
+        },
+      ];
+
+      // ==========================================
+      // 5. FETCH DASHBOARD DATA
+      // ==========================================
+
+      const [
+        overviewRows,
+        monthStatusRows,
+        salesRows,
+        paymentRows,
+        recentDocuments,
+        firstCodOrder,
+        firstCustomOrder,
+        current30Orders,
+        previous30Orders,
+      ] = await Promise.all([
+        orders.aggregate(overviewPipeline).toArray(),
+
+        orders.aggregate(monthStatusPipeline).toArray(),
+
+        orders.aggregate(salesPipeline).toArray(),
+
+        orders.aggregate(paymentPipeline).toArray(),
+
+        // ======================================
+        // RECENT 5 ORDERS
+        // Order Management-style table
+        // ======================================
+
+        orders
+          .find(
+            {},
+            {
+              projection: {
+                _id: 1,
+                uid: 1,
+                guest: 1,
+                orderNumber: 1,
+
+                "customer.name": 1,
+                "customer.phone": 1,
+
+                "shipping.phone": 1,
+
+                "items.name": 1,
+                "items.image": 1,
+                "items.quantity": 1,
+                "items.variantTitle": 1,
+                "items.cartId": 1,
+                "items.productId": 1,
+
+                total: 1,
+                status: 1,
+
+                "payment.method": 1,
+                "payment.status": 1,
+                "payment.verifiedAmount": 1,
+                "payment.dueAmount": 1,
+
+                "courier.name": 1,
+                "courier.trackingNumber": 1,
+
+                createdAt: 1,
+              },
+            },
+          )
+          .sort({
+            createdAt: -1,
+            _id: -1,
+          })
+          .limit(5)
+          .toArray(),
+
+        // First COD order requiring a call
+        orders.findOne(
+          {
+            status: "pending",
+            "payment.method": "cod",
+            phoneConfirmed: {
+              $ne: true,
+            },
+          },
+          {
+            sort: {
+              createdAt: 1,
+            },
+            projection: {
+              _id: 1,
+            },
+          },
+        ),
+
+        // First customized order in progress
+        orders.findOne(
+          {
+            status: {
+              $in: ["verified", "processing"],
+            },
+            "items.customization.mode": {
+              $in: ["frame", "note"],
+            },
+          },
+          {
+            sort: {
+              createdAt: 1,
+            },
+            projection: {
+              _id: 1,
+            },
+          },
+        ),
+
+        // Orders in current 30 days
+        orders.countDocuments({
+          createdAt: {
+            $gte: current30Start,
+            $lte: now,
+          },
+        }),
+
+        // Orders in previous 30 days
+        orders.countDocuments({
+          createdAt: {
+            $gte: previous30Start,
+            $lt: current30Start,
+          },
+        }),
+      ]);
+
+      // ==========================================
+      // 6. CUSTOMER PROFILE PHOTOS
+      // ==========================================
+
+      const recentUids = [
+        ...new Set(
+          recentDocuments
+            .filter((order) => !order.guest && order.uid)
+            .map((order) => order.uid),
+        ),
+      ];
+
+      const customerAccounts = recentUids.length
+        ? await users
+            .find(
+              {
+                uid: {
+                  $in: recentUids,
+                },
+              },
+              {
+                projection: {
+                  uid: 1,
+                  photoUrl: 1,
+                  photoURL: 1,
+                  imageUrl: 1,
+                  image_url: 1,
+                },
+              },
+            )
+            .toArray()
+        : [];
+
+      const customerPhotoMap = new Map(
+        customerAccounts.map((account) => [
+          account.uid,
+          account.photoUrl ||
+            account.photoURL ||
+            account.imageUrl ||
+            account.image_url ||
+            "",
+        ]),
+      );
+
+      // ==========================================
+      // 7. KPI RESULT
+      // ==========================================
+
+      const overview = overviewRows[0] || {};
+
+      const totalOrders = Number(overview.totalOrders) || 0;
+
+      const deliveredOrders = Number(overview.deliveredOrders) || 0;
+
+      const totalSales = roundMoney(overview.totalSales);
+
+      const outstandingBalance = roundMoney(overview.outstandingBalance);
+
+      const deliveryRate = totalOrders
+        ? Math.round((deliveredOrders / totalOrders) * 1000) / 10
+        : 0;
+
+      const orderGrowthPercent = percentChange(
+        current30Orders,
+        previous30Orders,
+      );
+
+      // ==========================================
+      // 8. DAILY SALES LOOKUP
+      // ==========================================
+
+      const dailySalesMap = new Map(
+        salesRows.map((row) => [row._id, roundMoney(row.sales)]),
+      );
+
+      const saleOn = (date) => dailySalesMap.get(date) || 0;
+
+      // ==========================================
+      // 9. DAILY SALES - LAST 7 DAYS
+      // ==========================================
+
+      const weekdayFormatter = new Intl.DateTimeFormat("bn-BD", {
+        weekday: "short",
+        timeZone: "UTC",
+      });
+
+      const daily = Array.from({ length: 7 }, (_, index) => {
+        const date = dayAt(index - 6);
+
+        return {
+          name: weekdayFormatter.format(date),
+          sales: saleOn(dateKey(date)),
+        };
+      });
+
+      // ==========================================
+      // 10. WEEKLY SALES - LAST 4 WEEKS
+      // ==========================================
+
+      const weekLabels = ["১ম", "২য়", "৩য়", "৪র্থ"];
+
+      const weekly = weekLabels.map((name, index) => {
+        const startOffset = -27 + index * 7;
+
+        let sales = 0;
+
+        for (let dayIndex = 0; dayIndex < 7; dayIndex++) {
+          const date = dayAt(startOffset + dayIndex);
+
+          sales += saleOn(dateKey(date));
+        }
+
+        return {
+          name,
+          sales: roundMoney(sales),
+        };
+      });
+
+      // ==========================================
+      // 11. MONTHLY SALES - LAST 6 MONTHS
+      // ==========================================
+
+      const monthlyFormatter = new Intl.DateTimeFormat("bn-BD", {
+        month: "short",
+        timeZone: "UTC",
+      });
+
+      const monthly = [];
+
+      for (let offset = 5; offset >= 0; offset--) {
+        const date = new Date(Date.UTC(year, month - offset, 1));
+
+        const monthKey = date.toISOString().slice(0, 7);
+
+        let sales = 0;
+
+        for (const [key, value] of dailySalesMap) {
+          if (key.startsWith(monthKey)) {
+            sales += value;
+          }
+        }
+
+        monthly.push({
+          name: monthlyFormatter.format(date),
+          sales: roundMoney(sales),
+        });
+      }
+
+      // ==========================================
+      // 12. SALES GROWTH - LAST 30 DAYS
+      // ==========================================
+
+      const current30Key = dateKey(new Date(todayCalendar - 29 * DAY_MS));
+
+      const previous30Key = dateKey(new Date(todayCalendar - 59 * DAY_MS));
+
+      let current30Sales = 0;
+      let previous30Sales = 0;
+
+      for (const [key, value] of dailySalesMap) {
+        if (key >= current30Key) {
+          current30Sales += value;
+        } else if (key >= previous30Key) {
+          previous30Sales += value;
+        }
+      }
+
+      const salesGrowthPercent = percentChange(
+        roundMoney(current30Sales),
+        roundMoney(previous30Sales),
+      );
+
+      // ==========================================
+      // 13. ORDER STATUS DISTRIBUTION
+      // ==========================================
+
+      const monthlyStatusCounts = Object.fromEntries(
+        monthStatusRows.map((item) => [item._id, item.count]),
+      );
+
+      const completed = monthlyStatusCounts.delivered || 0;
+
+      const processing =
+        (monthlyStatusCounts.verified || 0) +
+        (monthlyStatusCounts.processing || 0) +
+        (monthlyStatusCounts.shipped || 0);
+
+      const pending = monthlyStatusCounts.pending || 0;
+
+      const cancelled =
+        (monthlyStatusCounts.cancelled || 0) +
+        (monthlyStatusCounts.rejected || 0);
+
+      const statusData = [
+        {
+          name: "সম্পন্ন",
+          value: completed,
+          color: "#8d389e",
+        },
+        {
+          name: "প্রসেসিং",
+          value: processing,
+          color: "#df72ef",
+        },
+        {
+          name: "পেন্ডিং",
+          value: pending,
+          color: "#ffe16d",
+        },
+        {
+          name: "বাতিল",
+          value: cancelled,
+          color: "#c73e49",
+        },
+      ];
+
+      const statusTotal = statusData.reduce((sum, item) => sum + item.value, 0);
+
+      // ==========================================
+      // 14. VERIFIED PAYMENT BY METHOD
+      // ==========================================
+
+      const paymentMap = new Map(
+        paymentRows.map((item) => [item._id, roundMoney(item.amount)]),
+      );
+
+      const paymentData = [
+        {
+          name: "bKash",
+          amount: paymentMap.get("bkash") || 0,
+          color: "#8d389e",
+        },
+        {
+          name: "Nagad",
+          amount: paymentMap.get("nagad") || 0,
+          color: "#ffd700",
+        },
+        {
+          name: "Rocket",
+          amount: paymentMap.get("rocket") || 0,
+          color: "#310039",
+        },
+      ];
+
+      // ==========================================
+      // 15. RECENT ORDERS
+      // Order Management compatible format
+      // ==========================================
+
+      const recentOrders = recentDocuments.map((order) => {
+        const items = Array.isArray(order.items) ? order.items : [];
+
+        const itemCount = items.reduce(
+          (sum, item) => sum + (Number(item.quantity) || 0),
+          0,
+        );
+
+        const verifiedAmount = roundMoney(order.payment?.verifiedAmount);
+
+        const dueAmount = Math.max(
+          0,
+          roundMoney(
+            order.payment?.dueAmount ??
+              Number(order.total || 0) - verifiedAmount,
+          ),
+        );
+
+        return {
+          _id: order._id.toString(),
+
+          orderNumber: order.orderNumber || "—",
+
+          createdAt: order.createdAt || null,
+
+          status: order.status || "pending",
+
+          total: roundMoney(order.total),
+
+          guest: Boolean(order.guest),
+
+          // Customer information
+          customer: {
+            name: order.customer?.name || "Unknown Customer",
+
+            phone: order.customer?.phone || "",
+          },
+
+          shipping: {
+            phone: order.shipping?.phone || "",
+          },
+
+          // Registered customer avatar
+          customerPhotoUrl: order.guest
+            ? ""
+            : customerPhotoMap.get(order.uid) || "",
+
+          // Total quantity
+          itemCount,
+
+          // Maximum two product previews
+          items: items.slice(0, 2),
+
+          // Financial details
+          payment: {
+            method: order.payment?.method || null,
+
+            status: order.payment?.status || null,
+
+            verifiedAmount,
+
+            dueAmount,
+          },
+
+          // Courier information
+          courier: {
+            name: order.courier?.name || null,
+
+            trackingNumber: order.courier?.trackingNumber || null,
+          },
+        };
+      });
+
+      // ==========================================
+      // 16. FINAL DASHBOARD RESPONSE
+      // ==========================================
+
+      res.set("Cache-Control", "private, no-store");
+
+      return res.status(200).json({
+        success: true,
+
+        generatedAt: now.toISOString(),
+
+        // ======================================
+        // SIX KPI CARDS
+        // ======================================
+
+        kpis: {
+          totalOrders,
+
+          pendingOrders: Number(overview.pendingOrders) || 0,
+
+          pendingPayments: Number(overview.pendingPayments) || 0,
+
+          totalSales,
+
+          deliveredOrders,
+
+          outstandingBalance,
+
+          deliveryRate,
+
+          orderGrowthPercent,
+
+          salesGrowthPercent,
+        },
+
+        // ======================================
+        // NEEDS ATTENTION CARDS
+        // ======================================
+
+        attention: {
+          paymentPending: Number(overview.pendingPayments) || 0,
+
+          codUnconfirmed: Number(overview.codUnconfirmed) || 0,
+
+          customProcessing: Number(overview.customProcessing) || 0,
+
+          firstCodOrderId: firstCodOrder?._id?.toString() || null,
+
+          firstCustomOrderId: firstCustomOrder?._id?.toString() || null,
+        },
+
+        // ======================================
+        // SALES TREND
+        // ======================================
+
+        salesData: {
+          daily,
+          weekly,
+          monthly,
+        },
+
+        // ======================================
+        // ORDER STATUS CHART
+        // ======================================
+
+        statusData,
+        statusTotal,
+
+        // ======================================
+        // PAYMENT METHOD CHART
+        // ======================================
+
+        paymentData,
+
+        // ======================================
+        // RECENT ORDERS TABLE
+        // ======================================
+
+        recentOrders,
+      });
+    }),
+  );
+
+  // ===================================================
+  // ADMIN CUSTOMER MANAGEMENT - READ ONLY
+  // GET /admin/customers
+  //
+  // Existing dependencies:
+  // app, users, orders, verifyFirebaseToken,
+  // verifyAdmin, handle, str, fail
+  // ===================================================
+
+  app.get(
+    "/admin/customers",
+    verifyFirebaseToken,
+    verifyAdmin,
+    handle(async (req, res) => {
+      // ==========================================
+      // PAGINATION
+      // ==========================================
+
+      const pageRaw = str(req.query.page ?? "1", 6);
+
+      if (!/^[1-9]\d{0,5}$/.test(pageRaw)) {
+        fail("Invalid page number");
+      }
+
+      const page = Math.min(Number(pageRaw), 10000);
+
+      const perPage = 10;
+      const skip = (page - 1) * perPage;
+
+      // ==========================================
+      // FILTERS
+      // ==========================================
+
+      const search = str(req.query.search, 80);
+
+      const status = str(req.query.status || "all", 20).toLowerCase();
+
+      const ordersFilter = str(req.query.orders || "all", 20).toLowerCase();
+
+      const sort = str(req.query.sort || "newest", 30).toLowerCase();
+
+      if (!["all", "active", "restricted"].includes(status)) {
+        fail("Invalid customer status filter");
+      }
+
+      if (!["all", "with_orders", "no_orders"].includes(ordersFilter)) {
+        fail("Invalid customer order filter");
+      }
+
+      // ==========================================
+      // SORT OPTIONS
+      // ==========================================
+
+      const sorts = {
+        newest: {
+          createdAt: -1,
+          _id: -1,
+        },
+
+        oldest: {
+          createdAt: 1,
+          _id: 1,
+        },
+
+        orders: {
+          "summary.orderCount": -1,
+          createdAt: -1,
+          _id: -1,
+        },
+
+        spent: {
+          "summary.totalSpent": -1,
+          createdAt: -1,
+          _id: -1,
+        },
+
+        last_order: {
+          "summary.lastOrderAt": -1,
+          createdAt: -1,
+          _id: -1,
+        },
+      };
+
+      if (!Object.prototype.hasOwnProperty.call(sorts, sort)) {
+        fail("Invalid sort option");
+      }
+
+      // ==========================================
+      // CUSTOMER BASE FILTER
+      // ==========================================
+
+      const match = {
+        role: "customer",
+      };
+
+      if (status === "active") {
+        match.status = "active";
+      } else if (status === "restricted") {
+        match.status = {
+          $ne: "active",
+        };
+      }
+
+      // ==========================================
+      // SEARCH
+      // ==========================================
+
+      if (search) {
+        const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+        const regex = new RegExp(escaped, "i");
+
+        match.$or = [
+          {
+            displayName: regex,
+          },
+          {
+            email: regex,
+          },
+          {
+            phone: regex,
+          },
+          {
+            "checkoutProfile.name": regex,
+          },
+          {
+            "checkoutProfile.phone": regex,
+          },
+        ];
+      }
+
+      // ==========================================
+      // CURRENT MONTH IN BANGLADESH
+      // ==========================================
+
+      const offset = 6 * 60 * 60 * 1000;
+
+      const dhaka = new Date(Date.now() + offset);
+
+      const monthStart = new Date(
+        Date.UTC(dhaka.getUTCFullYear(), dhaka.getUTCMonth(), 1) - offset,
+      );
+
+      // ==========================================
+      // CUSTOMERS + ORDERS AGGREGATION
+      // ==========================================
+
+      const customerPipeline = [
+        {
+          $match: match,
+        },
+
+        // Match each registered user with
+        // orders belonging to their Firebase UID.
+        {
+          $lookup: {
+            from: "orders",
+
+            let: {
+              customerUid: "$uid",
+            },
+
+            pipeline: [
+              {
+                $match: {
+                  $expr: {
+                    $and: [
+                      {
+                        $eq: ["$uid", "$$customerUid"],
+                      },
+                      {
+                        $ne: ["$$customerUid", null],
+                      },
+                      {
+                        $ne: ["$$customerUid", ""],
+                      },
+                    ],
+                  },
+                },
+              },
+
+              {
+                $sort: {
+                  createdAt: -1,
+                  _id: -1,
+                },
+              },
+
+              {
+                $group: {
+                  _id: null,
+
+                  // All customer orders
+                  orderCount: {
+                    $sum: 1,
+                  },
+
+                  // Successfully delivered
+                  deliveredOrders: {
+                    $sum: {
+                      $cond: [
+                        {
+                          $eq: ["$status", "delivered"],
+                        },
+                        1,
+                        0,
+                      ],
+                    },
+                  },
+
+                  // Delivered order value
+                  totalSpent: {
+                    $sum: {
+                      $cond: [
+                        {
+                          $eq: ["$status", "delivered"],
+                        },
+                        {
+                          $ifNull: ["$total", 0],
+                        },
+                        0,
+                      ],
+                    },
+                  },
+
+                  lastOrderAt: {
+                    $first: "$createdAt",
+                  },
+
+                  lastOrderId: {
+                    $first: "$_id",
+                  },
+
+                  lastOrderNumber: {
+                    $first: "$orderNumber",
+                  },
+                },
+              },
+            ],
+
+            as: "orderSummary",
+          },
+        },
+
+        // Convert aggregation result into
+        // a single summary object.
+        {
+          $addFields: {
+            summary: {
+              $ifNull: [
+                {
+                  $arrayElemAt: ["$orderSummary", 0],
+                },
+                {},
+              ],
+            },
+          },
+        },
+
+        // ======================================
+        // ORDER ACTIVITY FILTER
+        // ======================================
+
+        ...(ordersFilter === "with_orders"
+          ? [
+              {
+                $match: {
+                  "summary.orderCount": {
+                    $gt: 0,
+                  },
+                },
+              },
+            ]
+          : ordersFilter === "no_orders"
+            ? [
+                {
+                  $match: {
+                    "summary.orderCount": {
+                      $exists: false,
+                    },
+                  },
+                },
+              ]
+            : []),
+
+        // ======================================
+        // PAGINATION + SAFE PROJECTION
+        // ======================================
+
+        {
+          $facet: {
+            metadata: [
+              {
+                $count: "total",
+              },
+            ],
+
+            customers: [
+              {
+                $sort: sorts[sort],
+              },
+
+              {
+                $skip: skip,
+              },
+
+              {
+                $limit: perPage,
+              },
+
+              {
+                $project: {
+                  _id: 0,
+
+                  uid: {
+                    $ifNull: ["$uid", ""],
+                  },
+
+                  name: {
+                    $ifNull: [
+                      "$displayName",
+                      {
+                        $ifNull: ["$checkoutProfile.name", ""],
+                      },
+                    ],
+                  },
+
+                  email: {
+                    $ifNull: ["$email", ""],
+                  },
+
+                  phone: {
+                    $ifNull: [
+                      "$phone",
+                      {
+                        $ifNull: ["$checkoutProfile.phone", ""],
+                      },
+                    ],
+                  },
+
+                  // Profile image fallback
+                  photoUrl: {
+                    $ifNull: [
+                      "$photoUrl",
+                      {
+                        $ifNull: [
+                          "$photoURL",
+                          {
+                            $ifNull: [
+                              "$imageUrl",
+                              {
+                                $ifNull: ["$image_url", ""],
+                              },
+                            ],
+                          },
+                        ],
+                      },
+                    ],
+                  },
+
+                  status: {
+                    $ifNull: ["$status", "unknown"],
+                  },
+
+                  division: {
+                    $ifNull: [
+                      "$checkoutProfile.division",
+                      {
+                        $ifNull: ["$division", ""],
+                      },
+                    ],
+                  },
+
+                  district: {
+                    $ifNull: [
+                      "$checkoutProfile.district",
+                      {
+                        $ifNull: ["$district", ""],
+                      },
+                    ],
+                  },
+
+                  address: {
+                    $ifNull: [
+                      "$checkoutProfile.address",
+                      {
+                        $ifNull: ["$address", ""],
+                      },
+                    ],
+                  },
+
+                  createdAt: 1,
+
+                  orderCount: {
+                    $ifNull: ["$summary.orderCount", 0],
+                  },
+
+                  deliveredOrders: {
+                    $ifNull: ["$summary.deliveredOrders", 0],
+                  },
+
+                  totalSpent: {
+                    $ifNull: ["$summary.totalSpent", 0],
+                  },
+
+                  lastOrderAt: {
+                    $ifNull: ["$summary.lastOrderAt", null],
+                  },
+
+                  lastOrderNumber: {
+                    $ifNull: ["$summary.lastOrderNumber", null],
+                  },
+
+                  lastOrderId: {
+                    $cond: [
+                      {
+                        $ifNull: ["$summary.lastOrderId", false],
+                      },
+                      {
+                        $toString: "$summary.lastOrderId",
+                      },
+                      null,
+                    ],
+                  },
+                },
+              },
+            ],
+          },
+        },
+      ];
+
+      // ==========================================
+      // GLOBAL CUSTOMER STATISTICS
+      // Independent of search and filters
+      // ==========================================
+
+      const statsPipeline = [
+        {
+          $match: {
+            role: "customer",
+          },
+        },
+
+        {
+          $group: {
+            _id: null,
+
+            total: {
+              $sum: 1,
+            },
+
+            active: {
+              $sum: {
+                $cond: [
+                  {
+                    $eq: ["$status", "active"],
+                  },
+                  1,
+                  0,
+                ],
+              },
+            },
+
+            restricted: {
+              $sum: {
+                $cond: [
+                  {
+                    $ne: ["$status", "active"],
+                  },
+                  1,
+                  0,
+                ],
+              },
+            },
+
+            newThisMonth: {
+              $sum: {
+                $cond: [
+                  {
+                    $gte: ["$createdAt", monthStart],
+                  },
+                  1,
+                  0,
+                ],
+              },
+            },
+          },
+        },
+      ];
+
+      // ==========================================
+      // FETCH DATABASE RESULTS
+      // ==========================================
+
+      const [listRows, statsRows, guestOrders] = await Promise.all([
+        users.aggregate(customerPipeline).toArray(),
+
+        users.aggregate(statsPipeline).toArray(),
+
+        orders.countDocuments({
+          guest: true,
+        }),
+      ]);
+
+      // ==========================================
+      // FORMAT RESULTS
+      // ==========================================
+
+      const list = listRows[0] || {};
+
+      const total = list.metadata?.[0]?.total || 0;
+
+      const summary = statsRows[0] || {};
+
+      const customers = (list.customers || []).map((customer) => ({
+        ...customer,
+
+        totalSpent: Math.round((Number(customer.totalSpent) || 0) * 100) / 100,
+      }));
+
+      // ==========================================
+      // FINAL RESPONSE
+      // ==========================================
+
+      res.set("Cache-Control", "private, no-store");
+
+      return res.status(200).json({
+        success: true,
+
+        customers,
+
+        stats: {
+          total: summary.total || 0,
+
+          active: summary.active || 0,
+
+          restricted: summary.restricted || 0,
+
+          newThisMonth: summary.newThisMonth || 0,
+
+          guestOrders,
+        },
+
+        pagination: {
+          page,
+
+          limit: perPage,
+
+          total,
+
+          totalPages: Math.max(1, Math.ceil(total / perPage)),
+
+          hasNextPage: page * perPage < total,
+
+          hasPreviousPage: page > 1,
+        },
+      });
+    }),
+  );
+
+  // =====================================================
+  // ADMIN DELIVERY MANAGEMENT
+  // GET /admin/deliveries
+  // Firebase Auth + Active Admin
+  // No automatic status updates
+  // =====================================================
+
+  app.get(
+    "/admin/deliveries",
+    verifyFirebaseToken,
+    verifyAdmin,
+    handle(async (req, res) => {
+      // =====================================
+      // PAGINATION & FILTER VALIDATION
+      // =====================================
+
+      const rawPage = str(req.query.page ?? "1", 6);
+
+      if (!/^[1-9]\d{0,5}$/.test(rawPage)) {
+        fail("Invalid page number");
+      }
+
+      const page = Math.min(10000, Number(rawPage));
+      const limit = 10;
+
+      const view = str(req.query.view || "all", 24).toLowerCase();
+
+      const sort = str(req.query.sort || "newest", 30).toLowerCase();
+
+      const search = str(req.query.search || "", 80);
+
+      const allowedViews = [
+        "all",
+        "verified",
+        "processing",
+        "shipped",
+        "delivered",
+        "overdue",
+        "upcoming",
+        "unassigned",
+      ];
+
+      if (!allowedViews.includes(view)) {
+        fail("Invalid delivery filter");
+      }
+
+      if (!["newest", "oldest", "eta_soon"].includes(sort)) {
+        fail("Invalid delivery sorting");
+      }
+
+      // =====================================
+      // FILTER CONDITIONS
+      // =====================================
+
+      const now = new Date();
+
+      const nextWeek = new Date(now.getTime() + 7 * 86400000);
+
+      const deliveryStatuses = [
+        "verified",
+        "processing",
+        "shipped",
+        "delivered",
+      ];
+
+      const missingCourier = {
+        $or: [
+          {
+            "courier.name": {
+              $in: [null, ""],
+            },
+          },
+          {
+            "courier.trackingNumber": {
+              $in: [null, ""],
+            },
+          },
+        ],
+      };
+
+      const clauses = [
+        {
+          status: {
+            $in: deliveryStatuses,
+          },
+        },
+      ];
+
+      // Status filtering
+      if (["verified", "processing", "shipped", "delivered"].includes(view)) {
+        clauses.push({ status: view });
+      }
+
+      // Overdue shipments
+      else if (view === "overdue") {
+        clauses.push({
+          status: "shipped",
+          estimatedDelivery: {
+            $type: "date",
+            $lt: now,
+          },
+        });
+      }
+
+      // Deliveries due in next 7 days
+      else if (view === "upcoming") {
+        clauses.push({
+          status: "shipped",
+          estimatedDelivery: {
+            $gte: now,
+            $lte: nextWeek,
+          },
+        });
+      }
+
+      // Missing courier information
+      else if (view === "unassigned") {
+        clauses.push(
+          {
+            status: {
+              $in: ["verified", "processing"],
+            },
+          },
+          missingCourier,
+        );
+      }
+
+      // =====================================
+      // SEARCH
+      // =====================================
+
+      if (search) {
+        const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+        const regex = new RegExp(escaped, "i");
+
+        clauses.push({
+          $or: [
+            { orderNumber: regex },
+            { "customer.name": regex },
+            { "customer.phone": regex },
+            { "shipping.phone": regex },
+            { "shipping.district": regex },
+            { "courier.name": regex },
+            { "courier.trackingNumber": regex },
+          ],
+        });
+      }
+
+      const query = {
+        $and: clauses,
+      };
+
+      // =====================================
+      // SORT
+      // =====================================
+
+      const orderBy =
+        sort === "oldest"
+          ? {
+              createdAt: 1,
+              _id: 1,
+            }
+          : sort === "eta_soon"
+            ? {
+                estimatedDelivery: 1,
+                createdAt: -1,
+                _id: -1,
+              }
+            : {
+                createdAt: -1,
+                _id: -1,
+              };
+
+      // =====================================
+      // FETCH ORDERS, COUNTS & STATS
+      // =====================================
+
+      const [docs, total, byStatus, overdueCount] = await Promise.all([
+        // Filtered delivery orders
+        orders
+          .find(query, {
+            projection: {
+              _id: 1,
+              uid: 1,
+              guest: 1,
+              orderNumber: 1,
+              createdAt: 1,
+              status: 1,
+              total: 1,
+              estimatedDelivery: 1,
+              deliveredAt: 1,
+
+              "customer.name": 1,
+              "customer.phone": 1,
+
+              "shipping.phone": 1,
+              "shipping.address": 1,
+              "shipping.district": 1,
+              "shipping.division": 1,
+
+              "courier.name": 1,
+              "courier.trackingNumber": 1,
+              "courier.trackingUrl": 1,
+              "courier.parcelWeight": 1,
+
+              "payment.method": 1,
+              "payment.status": 1,
+
+              "items.name": 1,
+              "items.image": 1,
+              "items.quantity": 1,
+              "items.cartId": 1,
+            },
+          })
+          .sort(orderBy)
+          .skip((page - 1) * limit)
+          .limit(limit)
+          .toArray(),
+
+        // Filtered total
+        orders.countDocuments(query),
+
+        // Global status stats
+        orders
+          .aggregate([
+            {
+              $match: {
+                status: {
+                  $in: deliveryStatuses,
+                },
+              },
+            },
+            {
+              $group: {
+                _id: "$status",
+                total: {
+                  $sum: 1,
+                },
+              },
+            },
+          ])
+          .toArray(),
+
+        // Global overdue count
+        orders.countDocuments({
+          status: "shipped",
+          estimatedDelivery: {
+            $type: "date",
+            $lt: now,
+          },
+        }),
+      ]);
+
+      // =====================================
+      // REGISTERED CUSTOMER PROFILE IMAGES
+      // =====================================
+
+      const customerUids = [
+        ...new Set(
+          docs
+            .filter((order) => !order.guest && order.uid)
+            .map((order) => order.uid),
+        ),
+      ];
+
+      const accounts = customerUids.length
+        ? await users
+            .find(
+              {
+                uid: {
+                  $in: customerUids,
+                },
+              },
+              {
+                projection: {
+                  uid: 1,
+                  photoUrl: 1,
+                  photoURL: 1,
+                  imageUrl: 1,
+                  image_url: 1,
+                },
+              },
+            )
+            .toArray()
+        : [];
+
+      const photos = new Map(
+        accounts.map((account) => [
+          account.uid,
+          account.photoUrl ||
+            account.photoURL ||
+            account.imageUrl ||
+            account.image_url ||
+            "",
+        ]),
+      );
+
+      // =====================================
+      // STATUS COUNTS
+      // =====================================
+
+      const counts = Object.fromEntries(
+        byStatus.map((item) => [item._id, item.total]),
+      );
+
+      // =====================================
+      // DELIVERY TABLE RESPONSE
+      // =====================================
+
+      const deliveries = docs.map((order) => {
+        const items = Array.isArray(order.items) ? order.items : [];
+
+        return {
+          _id: order._id.toString(),
+
+          orderNumber: order.orderNumber,
+
+          createdAt: order.createdAt,
+
+          status: order.status,
+
+          total: Number(order.total || 0),
+
+          guest: order.guest === true,
+
+          customer: {
+            name: order.customer?.name || "",
+            phone: order.customer?.phone || "",
+          },
+
+          customerPhotoUrl: order.guest ? "" : photos.get(order.uid) || "",
+
+          shipping: order.shipping || {},
+
+          courier: {
+            name: order.courier?.name || "",
+
+            trackingNumber: order.courier?.trackingNumber || "",
+
+            trackingUrl: order.courier?.trackingUrl || "",
+
+            parcelWeight: order.courier?.parcelWeight || "",
+          },
+
+          payment: {
+            method: order.payment?.method || "",
+            status: order.payment?.status || "",
+          },
+
+          estimatedDelivery: order.estimatedDelivery || null,
+
+          deliveredAt: order.deliveredAt || null,
+
+          itemCount: items.reduce(
+            (sum, item) => sum + (Number(item.quantity) || 0),
+            0,
+          ),
+
+          items: items.slice(0, 2).map((item) => ({
+            name: item.name || "",
+            image: item.image || "",
+            quantity: Number(item.quantity || 1),
+            cartId: item.cartId || "",
+          })),
+        };
+      });
+
+      // =====================================
+      // FINAL RESPONSE
+      // =====================================
+
+      res.set("Cache-Control", "private, no-store");
+
+      return res.json({
+        success: true,
+
+        stats: {
+          verified: counts.verified || 0,
+          processing: counts.processing || 0,
+          shipped: counts.shipped || 0,
+          delivered: counts.delivered || 0,
+          overdue: overdueCount,
+        },
+
+        deliveries,
+
+        pagination: {
+          page,
+          limit,
+          total,
+
+          totalPages: Math.max(1, Math.ceil(total / limit)),
+
+          hasNextPage: page * limit < total,
+
+          hasPreviousPage: page > 1,
+        },
       });
     }),
   );
