@@ -25,7 +25,13 @@ app.use(cors());
 // =========== firebase admin sdk setup =============
 const { getAuth } = require("firebase-admin/auth");
 const { initializeApp, cert } = require("firebase-admin/app");
-const serviceAccount = require("./sokh-bilash-firebase-admin-sdk.json");
+
+//================================
+const decoded = Buffer.from(process.env.FB_SERVICE_KEY, "base64").toString(
+  "utf8",
+);
+const serviceAccount = JSON.parse(decoded);
+
 initializeApp({ credential: cert(serviceAccount) });
 
 //=============  verifyFirebaseToken ================
@@ -82,8 +88,6 @@ async function run() {
   const categories = DB.collection("categories");
   const occasions = DB.collection("occasions");
   const products = DB.collection("products");
-  const carts = DB.collection("carts");
-  const orders = DB.collection("orders");
 
   // ==========================================
   // ADMIN MIDDLEWARE
@@ -2555,11 +2559,11 @@ async function run() {
   // CONNECTION CHECK
   // ==========================================
 
-  await client.db("admin").command({
-    ping: 1,
-  });
+  // await client.db("admin").command({
+  //   ping: 1,
+  // });
 
-  console.log("SokhBilash MongoDB connected; routes initialized");
+  // console.log("SokhBilash MongoDB connected; routes initialized");
 }
 run().catch(console.dir);
 
