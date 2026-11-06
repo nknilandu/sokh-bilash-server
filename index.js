@@ -2,6 +2,9 @@ const express = require("express");
 const cors = require("cors");
 require("dotenv").config();
 const app = express();
+
+// API routes are added only after MongoDB initialization.
+const apiRouter = express.Router();
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const port = process.env.PORT || 3000;
 
@@ -81,6 +84,9 @@ const client = new MongoClient(uri, {
 });
 
 async function run() {
+  // Register API routes on the dedicated router, not the outer app.
+  const app = apiRouter;
+
   await client.connect();
 
   const DB = client.db("sokhBilash");
@@ -2565,24 +2571,38 @@ async function run() {
 
   // console.log("SokhBilash MongoDB connected; routes initialized");
 }
-run().catch(console.dir);
+// Initialize MongoDB, seed data, create indexes, and register routes once.
+const routesReady = run();
 
+// Health endpoint: reachable even while database initialization is pending.
 app.get("/", (req, res) => {
-  res.send("Successfully connected to SokhBilash");
+  res.status(200).json({
+    success: true,
+    message: "SokhBilash Backend API is running",
+  });
 });
 
-// Initialize MongoDB and register all routes
-routesReady = run();
+// Wait for database initialization, then forward requests to the API router.
+app.use(async (req, res, next) => {
+  try {
+    await routesReady;
+    return apiRouter(req, res, next);
+  } catch (error) {
+    console.error("Backend initialization failed:", error.message);
 
-// Log initialization failures
-routesReady.catch((error) => {
-  console.error("Server initialization failed:", error);
+    if (res.headersSent) return next(error);
+
+    return res.status(503).json({
+      success: false,
+      message: "Backend initialization failed. Check server logs.",
+    });
+  }
 });
 
-// Export Express app for Vercel
+// Vercel uses the exported Express app.
 module.exports = app;
 
-// Start HTTP server only when running locally
+// Local Node.js / nodemon runs a normal HTTP server.
 if (require.main === module) {
   routesReady
     .then(() => {
@@ -2590,7 +2610,8 @@ if (require.main === module) {
         console.log(`SokhBilash API running on port ${port}`);
       });
     })
-    .catch(() => {
+    .catch((error) => {
+      console.error("Server initialization failed:", error);
       process.exitCode = 1;
     });
 }
