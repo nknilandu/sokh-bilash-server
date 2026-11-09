@@ -1,7 +1,8 @@
+// Part 1
+
 const { ObjectId } = require("mongodb");
 const { getAuth } = require("firebase-admin/auth");
 const { rateLimit } = require("express-rate-limit");
-
 const {
   randomUUID,
   randomBytes,
@@ -10,15 +11,7 @@ const {
   timingSafeEqual,
 } = require("node:crypto");
 
-// ===========================================
-// BANGLADESH DIVISIONS & DISTRICTS
-// ===========================================
-
 const DISTRICTS = require("../utils/bangladeshRegions");
-
-// ===========================================
-// MAIN ROUTE REGISTRATION
-// ===========================================
 
 module.exports = async function registerCommerceRoutes({
   app,
@@ -30,7 +23,6 @@ module.exports = async function registerCommerceRoutes({
 }) {
   const carts = DB.collection("carts");
   const orders = DB.collection("orders");
-
   const LIMIT_ITEMS = 100;
   const LIMIT_QTY = 10;
   const LIMIT_PHOTOS = 20;
@@ -49,16 +41,6 @@ module.exports = async function registerCommerceRoutes({
       .map((host) => host.trim().toLowerCase())
       .filter(Boolean),
   );
-
-  // =========================================
-  // DATABASE INDEXES & MIGRATION
-  // =========================================
-
-  // Populate transaction history keys for
-  // existing orders that have a TrxID.
-  //
-  // Back up the database and check for
-  // historical duplicate TrxIDs first.
 
   await orders.updateMany(
     {
@@ -80,11 +62,8 @@ module.exports = async function registerCommerceRoutes({
 
   await Promise.all([
     carts.createIndex({ uid: 1 }, { unique: true }),
-
     orders.createIndex({ checkoutId: 1 }, { unique: true }),
-
     orders.createIndex({ orderNumber: 1 }, { unique: true }),
-
     orders.createIndex(
       { paymentTrxIds: 1 },
       {
@@ -94,26 +73,10 @@ module.exports = async function registerCommerceRoutes({
         },
       },
     ),
-
-    orders.createIndex({
-      uid: 1,
-      createdAt: -1,
-    }),
-
-    orders.createIndex({
-      status: 1,
-      createdAt: -1,
-    }),
-
-    orders.createIndex({
-      "payment.status": 1,
-      createdAt: -1,
-    }),
+    orders.createIndex({ uid: 1, createdAt: -1 }),
+    orders.createIndex({ status: 1, createdAt: -1 }),
+    orders.createIndex({ "payment.status": 1, createdAt: -1 }),
   ]);
-
-  // =========================================
-  // RATE LIMITING
-  // =========================================
 
   const limit = (max, message) =>
     rateLimit({
@@ -121,25 +84,14 @@ module.exports = async function registerCommerceRoutes({
       limit: max,
       standardHeaders: "draft-7",
       legacyHeaders: false,
-      message: {
-        success: false,
-        message,
-      },
+      message: { success: false, message },
     });
 
   const quoteLimit = limit(40, "Too many quote requests");
-
   const orderLimit = limit(8, "Too many order attempts");
-
   const trackingLimit = limit(5, "Too many tracking attempts");
-
   const proofLimit = limit(5, "Too many payment submissions");
-
   const lookupLimit = limit(10, "Too many order lookups");
-
-  // =========================================
-  // COMMON HELPERS
-  // =========================================
 
   const fail = (message, status = 400) => {
     const error = new Error(message);
@@ -152,9 +104,7 @@ module.exports = async function registerCommerceRoutes({
       await fn(req, res);
     } catch (error) {
       console.error("Commerce API:", error.message);
-
       const status = error.status || (error.code === 11000 ? 409 : 500);
-
       if (!res.headersSent) {
         res.status(status).json({
           success: false,
@@ -170,17 +120,9 @@ module.exports = async function registerCommerceRoutes({
 
   const str = (value, max = 500) => {
     if (value == null) return "";
-
-    if (typeof value !== "string") {
-      fail("Invalid text value");
-    }
-
+    if (typeof value !== "string") fail("Invalid text value");
     const clean = value.trim();
-
-    if (clean.length > max) {
-      fail(`Text exceeds ${max} characters`);
-    }
-
+    if (clean.length > max) fail(`Text exceeds ${max} characters`);
     return clean;
   };
 
@@ -188,18 +130,14 @@ module.exports = async function registerCommerceRoutes({
 
   const requireId = (value) => {
     const id = str(value, 128);
-
     if (!/^[a-zA-Z0-9_-]{8,128}$/.test(id)) {
       fail("Invalid request ID");
     }
-
     return id;
   };
 
-  // Secure UUID v4 only.
   const checkoutIdOf = (value) => {
     const id = requireId(value).toLowerCase();
-
     if (
       !/^[a-f\d]{8}-[a-f\d]{4}-4[a-f\d]{3}-[89ab][a-f\d]{3}-[a-f\d]{12}$/.test(
         id,
@@ -207,16 +145,57 @@ module.exports = async function registerCommerceRoutes({
     ) {
       fail("checkoutId must be UUID v4");
     }
-
     return id;
   };
 
   const currency = (value) =>
     Math.round((Number(value) + Number.EPSILON) * 100) / 100;
 
-  // Strict amount validation.
-  // Reject missing, negative, exponential,
-  // invalid and >2-decimal amounts.
+  // Total received can include both online payment and delivery cash.
+  const onlineReceived = (payment) =>
+    Math.max(
+      0,
+      currency(
+        payment?.onlineVerifiedAmount ??
+          (payment?.verifiedAmount || 0) - (payment?.cashCollected || 0),
+      ),
+    );
+
+  const refundableBalance = (payment) =>
+    Math.max(
+      0,
+      currency((payment?.verifiedAmount || 0) - (payment?.refundedAmount || 0)),
+    );
+
+  const mongoOnlineReceived = {
+    $max: [
+      0,
+      {
+        $ifNull: [
+          "$payment.onlineVerifiedAmount",
+          {
+            $subtract: [
+              { $ifNull: ["$payment.verifiedAmount", 0] },
+              { $ifNull: ["$payment.cashCollected", 0] },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+
+  const newCancellationRefund = (payment, reason, now) => {
+    const remaining = refundableBalance(payment);
+
+    return {
+      status: remaining > 0 ? "pending" : "not_required",
+      totalAmount: remaining,
+      remainingAmount: remaining,
+      reason: reason || "Order cancelled",
+      createdAt: now,
+      completedAt: remaining === 0 ? now : null,
+    };
+  };
 
   const parseAmount = (value, label = "Amount") => {
     if (typeof value !== "string" && typeof value !== "number") {
@@ -246,7 +225,6 @@ module.exports = async function registerCommerceRoutes({
   const validHttpsUrl = (value) => {
     try {
       const url = new URL(value);
-
       return url.protocol === "https:" && !url.username && !url.password;
     } catch {
       return false;
@@ -254,41 +232,25 @@ module.exports = async function registerCommerceRoutes({
   };
 
   const validCustomerPhoto = (value) => {
-    if (!validHttpsUrl(value)) {
-      return false;
-    }
-
+    if (!validHttpsUrl(value)) return false;
     return allowedImageHosts.has(new URL(value).hostname.toLowerCase());
   };
 
   const orderFilter = (identifier) => {
     const value = str(identifier, 100);
-
-    if (!value) {
-      fail("Order identifier required");
-    }
+    if (!value) fail("Order identifier required");
 
     if (validObjectId(value)) {
       return {
-        $or: [
-          {
-            _id: new ObjectId(value),
-          },
-          {
-            orderNumber: value,
-          },
-        ],
+        $or: [{ _id: new ObjectId(value) }, { orderNumber: value }],
       };
     }
 
-    return {
-      orderNumber: value.toUpperCase(),
-    };
+    return { orderNumber: value.toUpperCase() };
   };
 
-  // Never expose internal order secrets.
-
-  const viewOrder = (doc) => {
+  // Admin-only response.
+  const viewAdminOrder = (doc) => {
     if (!doc) return null;
 
     const { checkoutId, guestTokenHash, paymentTrxIds, ...rest } = doc;
@@ -299,28 +261,103 @@ module.exports = async function registerCommerceRoutes({
     };
   };
 
-  // =========================================
-  // DELIVERY VALIDATION
-  // =========================================
+  // Customer and guest responses must exclude private admin data.
+  const viewOrder = (doc) => {
+    const original = viewAdminOrder(doc);
+    if (!original) return null;
+
+    const { payment: rawPayment, history, phoneConfirmation } = original;
+
+    const p = rawPayment || {};
+    const r = p.excessResolution;
+    const c = p.cancellationRefund;
+
+    return {
+      _id: original._id,
+      orderNumber: original.orderNumber,
+      guest: original.guest === true,
+      customer: original.customer,
+      shipping: original.shipping,
+      items: original.items,
+      subtotal: original.subtotal,
+      deliveryCharge: original.deliveryCharge,
+      giftWrapCharge: original.giftWrapCharge || 0,
+      giftOptions: original.giftOptions || { message: "" },
+      discount: original.discount || 0,
+      total: original.total,
+      status: original.status,
+      phoneConfirmed: original.phoneConfirmed === true,
+      courier: original.courier || null,
+      estimatedDelivery: original.estimatedDelivery || null,
+      deliveredAt: original.deliveredAt || null,
+      createdAt: original.createdAt,
+      updatedAt: original.updatedAt,
+
+      payment: {
+        method: p.method || null,
+        status: p.status || null,
+        senderPhone: p.senderPhone || null,
+        trxId: p.trxId || null,
+        claimedAmount: currency(p.claimedAmount || 0),
+        note: p.note || "",
+        claimDifference: p.claimDifference || null,
+        verifiedAmount: currency(p.verifiedAmount || 0),
+        onlineVerifiedAmount: currency(
+          p.onlineVerifiedAmount ??
+            Math.max(0, (p.verifiedAmount || 0) - (p.cashCollected || 0)),
+        ),
+        cashCollected: currency(p.cashCollected || 0),
+        dueAmount: currency(p.dueAmount || 0),
+        excessAmount: currency(p.excessAmount || 0),
+        refundedAmount: currency(p.refundedAmount || 0),
+        rejectedReason: p.rejectedReason || null,
+        verifiedAt: p.verifiedAt || null,
+
+        excessResolution: r
+          ? {
+              type: r.type,
+              amount: r.amount,
+              status: r.status,
+              completedAt: r.completedAt || null,
+            }
+          : null,
+
+        cancellationRefund: c
+          ? {
+              status: c.status,
+              totalAmount: c.totalAmount,
+              remainingAmount: c.remainingAmount,
+              completedAt: c.completedAt || null,
+            }
+          : null,
+      },
+
+      phoneConfirmation: phoneConfirmation
+        ? {
+            confirmed: phoneConfirmation.confirmed === true,
+            confirmedAt: phoneConfirmation.confirmedAt || null,
+          }
+        : null,
+
+      history: (Array.isArray(history) ? history : [])
+        .filter((entry) => entry.status !== "internal_note_added")
+        .map((entry) => ({
+          status: entry.status,
+          date: entry.date,
+        })),
+    };
+  };
 
   const region = (customer) => {
     const division = str(customer?.division, 80);
-
     const district = str(customer?.district, 80);
 
     if (!DISTRICTS[division]?.includes(district)) {
       fail("Invalid division or district");
     }
 
-    return {
-      division,
-      district,
-    };
+    return { division, district };
   };
-
-  // =========================================
-  // OPTIONAL FIREBASE AUTH
-  // =========================================
 
   const optionalAuth = async (req, res, next) => {
     const header = req.headers.authorization;
@@ -339,7 +376,6 @@ module.exports = async function registerCommerceRoutes({
 
     try {
       req.user = await getAuth().verifyIdToken(header.slice(7).trim());
-
       return next();
     } catch {
       return res.status(401).json({
@@ -349,16 +385,10 @@ module.exports = async function registerCommerceRoutes({
     }
   };
 
-  // ==========================================
-  // ALLOW GUEST OR ACTIVE CUSTOMER ONLY
-  // BLOCK ADMIN FROM CHECKOUT AND ORDERS
-  // ==========================================
+  // Part 2 — Cart APIs
 
   const customerOrGuest = async (req, res, next) => {
-    // Guest customer (no Firebase account)
-    if (!req.user) {
-      return next();
-    }
+    if (!req.user) return next();
 
     try {
       const account = await users.findOne({
@@ -387,10 +417,6 @@ module.exports = async function registerCommerceRoutes({
     }
   };
 
-  // =========================================
-  // ACTIVE ACCOUNT CHECK
-  // =========================================
-
   const activeAccount = async (req, res, next) => {
     try {
       const account = await users.findOne({
@@ -418,9 +444,9 @@ module.exports = async function registerCommerceRoutes({
     }
   };
 
-  // =========================================
-  // PRODUCT + VARIANT VALIDATION
-  // =========================================
+  // ==========================================
+  // PRODUCT + CART LINE
+  // ==========================================
 
   const buildCartLine = async (raw) => {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
@@ -439,29 +465,19 @@ module.exports = async function registerCommerceRoutes({
       fail("Invalid quantity");
     }
 
-    // Always load product from MongoDB.
-
     const product = await products.findOne({
       _id: new ObjectId(productId),
       status: "published",
     });
 
-    if (!product) {
-      fail("Product not found", 404);
-    }
-
-    if (product.available !== true) {
-      fail("Product unavailable", 409);
-    }
-
-    // VARIANT
+    if (!product) fail("Product not found", 404);
+    if (product.available !== true) fail("Product unavailable", 409);
 
     let variant = null;
     let variantKey = "";
 
     if (product.variantsEnabled === true) {
       variantKey = str(raw.variantKey, 220);
-
       variant = (product.variants || []).find((v) => v.key === variantKey);
 
       if (!variant || variant.available === false) {
@@ -469,10 +485,7 @@ module.exports = async function registerCommerceRoutes({
       }
     }
 
-    // SERVER-SIDE PRICE
-
     const regularPrice = Number(product.regularPrice);
-
     const sale = Number(product.salePrice);
 
     if (!Number.isFinite(regularPrice) || regularPrice <= 0) {
@@ -490,8 +503,6 @@ module.exports = async function registerCommerceRoutes({
       fail("Invalid variant price", 409);
     }
 
-    // PACKAGING
-
     const packaging = raw.packaging ?? "regular";
 
     if (!["regular", "premium"].includes(packaging)) {
@@ -505,16 +516,9 @@ module.exports = async function registerCommerceRoutes({
     }
 
     const extra = packaging === "premium" ? premiumBoxPrice : 0;
-
     const unitPrice = currency(variantPrice + extra);
 
-    if (unitPrice <= 0) {
-      fail("Invalid unit price", 409);
-    }
-
-    // =======================================
-    // CUSTOMER CUSTOMIZATION
-    // =======================================
+    if (unitPrice <= 0) fail("Invalid unit price", 409);
 
     const custom = raw.customization ?? {};
 
@@ -557,7 +561,6 @@ module.exports = async function registerCommerceRoutes({
 
       customization.photos = photoList.map((photo) => {
         const url = str(photo?.url, 2048);
-
         const size = Number(photo?.size || 0);
 
         if (!validCustomerPhoto(url)) {
@@ -570,9 +573,7 @@ module.exports = async function registerCommerceRoutes({
 
         return {
           id: str(photo?.id, 100) || randomUUID(),
-
           name: str(photo?.name, 200),
-
           size,
           url,
         };
@@ -586,9 +587,7 @@ module.exports = async function registerCommerceRoutes({
       }
 
       customization.name = str(custom.name, 150);
-
       customization.date = str(custom.date, 20);
-
       customization.message = str(custom.message, 1000);
 
       if (
@@ -603,29 +602,16 @@ module.exports = async function registerCommerceRoutes({
       customization.note = str(custom.note, 2000);
     }
 
-    // =======================================
-    // CART ITEM IDENTITY
-    // =======================================
-
-    const surpriseBox =
-      product.surpriseBox === true && raw.surpriseBox === true;
-
     const signature = digest(
       JSON.stringify({
         productId,
         variantKey,
         packaging,
-        surpriseBox,
         mode,
-
         name: customization.name,
-
         date: customization.date,
-
         message: customization.message,
-
         note: customization.note,
-
         photoUrls: customization.photos.map((p) => p.url),
       }),
     );
@@ -641,47 +627,28 @@ module.exports = async function registerCommerceRoutes({
         /^[a-zA-Z0-9_-]{8,128}$/.test(raw.cartId)
           ? raw.cartId
           : randomUUID(),
-
       signature,
       productId,
-
       slug: product.slug || "",
-
       name: product.name,
-
       sku: variant?.sku || product.sku,
-
       image,
       quantity,
-
       variantKey,
-
       variantTitle: variant?.title || "",
-
-      selectedOptions: variant
-        ? {
-            ...variant.options,
-          }
-        : {},
-
+      selectedOptions: variant ? { ...variant.options } : {},
       packaging,
-
       premiumBoxPrice: extra,
-
-      surpriseBox,
       customization,
-
       price: unitPrice,
-
       unitPrice,
-
       addedAt: new Date().toISOString(),
     };
   };
 
-  // =========================================
-  // CART ITEM MERGING
-  // =========================================
+  // ==========================================
+  // CART MERGING AND ATOMIC UPDATE
+  // ==========================================
 
   const combineLine = (lines, incoming) => {
     const old = lines.find((line) => line.signature === incoming.signature);
@@ -697,11 +664,8 @@ module.exports = async function registerCommerceRoutes({
         line.cartId === old.cartId
           ? {
               ...incoming,
-
               cartId: old.cartId,
-
               quantity,
-
               addedAt: old.addedAt,
             }
           : line,
@@ -716,24 +680,12 @@ module.exports = async function registerCommerceRoutes({
       ? randomUUID()
       : incoming.cartId;
 
-    return [
-      ...lines,
-      {
-        ...incoming,
-        cartId,
-      },
-    ];
+    return [...lines, { ...incoming, cartId }];
   };
-
-  // =========================================
-  // ATOMIC CART UPDATE
-  // =========================================
 
   const mutateCart = async (uid, cb) => {
     for (let attempt = 0; attempt < 10; attempt++) {
-      const current = await carts.findOne({
-        uid,
-      });
+      const current = await carts.findOne({ uid });
 
       const base = current || {
         uid,
@@ -745,25 +697,17 @@ module.exports = async function registerCommerceRoutes({
 
       const change = await cb({
         items: [...(base.items || [])],
-
         mergeIds: [...(base.mergeIds || [])],
-
         operationIds: [...(base.operationIds || [])],
       });
 
-      if (change === null) {
-        return base;
-      }
+      if (change === null) return base;
 
       const data = {
         uid,
-
         items: change.items,
-
         mergeIds: change.mergeIds,
-
         operationIds: change.operationIds,
-
         updatedAt: new Date(),
       };
 
@@ -771,44 +715,28 @@ module.exports = async function registerCommerceRoutes({
         try {
           await carts.insertOne({
             ...data,
-
             version: 1,
-
             createdAt: new Date(),
           });
 
-          return {
-            ...data,
-            version: 1,
-          };
+          return { ...data, version: 1 };
         } catch (error) {
-          if (error.code === 11000) {
-            continue;
-          }
-
+          if (error.code === 11000) continue;
           throw error;
         }
       }
 
       const result = await carts.updateOne(
-        {
-          uid,
-
-          version: current.version,
-        },
+        { uid, version: current.version },
         {
           $set: data,
-
-          $inc: {
-            version: 1,
-          },
+          $inc: { version: 1 },
         },
       );
 
       if (result.modifiedCount === 1) {
         return {
           ...data,
-
           version: current.version + 1,
         };
       }
@@ -818,9 +746,7 @@ module.exports = async function registerCommerceRoutes({
   };
 
   const viewCart = async (uid) => {
-    const doc = await carts.findOne({
-      uid,
-    });
+    const doc = await carts.findOne({ uid });
 
     const hydrated = await Promise.all(
       (doc?.items || []).map(async (item) => {
@@ -829,19 +755,14 @@ module.exports = async function registerCommerceRoutes({
 
           return {
             ...fresh,
-
             cartId: item.cartId,
-
             addedAt: item.addedAt,
-
             unavailable: false,
           };
         } catch (error) {
           return {
             ...item,
-
             unavailable: true,
-
             unavailableReason: error.message,
           };
         }
@@ -850,22 +771,19 @@ module.exports = async function registerCommerceRoutes({
 
     return {
       items: hydrated,
-
       version: doc?.version || 0,
-
       totalQuantity: hydrated.reduce((sum, line) => sum + line.quantity, 0),
-
       subtotal: currency(
         hydrated
-          .filter((l) => !l.unavailable)
+          .filter((line) => !line.unavailable)
           .reduce((sum, line) => sum + line.unitPrice * line.quantity, 0),
       ),
     };
   };
 
-  // =========================================
-  // GET CART
-  // =========================================
+  // ==========================================
+  // CART ROUTES
+  // ==========================================
 
   app.get(
     "/cart",
@@ -876,15 +794,10 @@ module.exports = async function registerCommerceRoutes({
 
       res.json({
         success: true,
-
         ...(await viewCart(req.user.uid)),
       });
     }),
   );
-
-  // =========================================
-  // ADD TO CART
-  // =========================================
 
   app.post(
     "/cart/items",
@@ -913,17 +826,11 @@ module.exports = async function registerCommerceRoutes({
 
       res.status(201).json({
         success: true,
-
         message: "Product added to cart",
-
         cart: await viewCart(req.user.uid),
       });
     }),
   );
-
-  // =========================================
-  // UPDATE CART CONFIGURATION
-  // =========================================
 
   app.patch(
     "/cart/items/:cartId/configuration",
@@ -934,16 +841,13 @@ module.exports = async function registerCommerceRoutes({
 
       const validated = await buildCartLine({
         ...(req.body.item || req.body),
-
         cartId,
       });
 
       await mutateCart(req.user.uid, (cart) => {
         const index = cart.items.findIndex((line) => line.cartId === cartId);
 
-        if (index < 0) {
-          fail("Cart item not found", 404);
-        }
+        if (index < 0) fail("Cart item not found", 404);
 
         const previous = cart.items[index];
 
@@ -961,11 +865,8 @@ module.exports = async function registerCommerceRoutes({
 
         cart.items[index] = {
           ...validated,
-
           cartId,
-
           addedAt: previous.addedAt,
-
           updatedAt: new Date().toISOString(),
         };
 
@@ -974,17 +875,11 @@ module.exports = async function registerCommerceRoutes({
 
       res.json({
         success: true,
-
         message: "Cart item updated",
-
         cart: await viewCart(req.user.uid),
       });
     }),
   );
-
-  // =========================================
-  // UPDATE QUANTITY
-  // =========================================
 
   app.patch(
     "/cart/items/:cartId",
@@ -1002,17 +897,10 @@ module.exports = async function registerCommerceRoutes({
           (line) => line.cartId === req.params.cartId,
         );
 
-        if (!item) {
-          fail("Cart item not found", 404);
-        }
+        if (!item) fail("Cart item not found", 404);
 
         cart.items = cart.items.map((line) =>
-          line.cartId === item.cartId
-            ? {
-                ...line,
-                quantity,
-              }
-            : line,
+          line.cartId === item.cartId ? { ...line, quantity } : line,
         );
 
         return cart;
@@ -1020,15 +908,10 @@ module.exports = async function registerCommerceRoutes({
 
       res.json({
         success: true,
-
         cart: await viewCart(req.user.uid),
       });
     }),
   );
-
-  // =========================================
-  // REMOVE CART ITEM
-  // =========================================
 
   app.delete(
     "/cart/items/:cartId",
@@ -1051,15 +934,10 @@ module.exports = async function registerCommerceRoutes({
 
       res.json({
         success: true,
-
         cart: await viewCart(req.user.uid),
       });
     }),
   );
-
-  // =========================================
-  // CLEAR CART
-  // =========================================
 
   app.delete(
     "/cart",
@@ -1078,15 +956,6 @@ module.exports = async function registerCommerceRoutes({
     }),
   );
 
-  // =========================================
-  // MERGE GUEST CART
-  // =========================================
-
-  // =========================================
-  // MERGE GUEST CART
-  // POST /cart/merge
-  // =========================================
-
   app.post(
     "/cart/merge",
     verifyFirebaseToken,
@@ -1095,46 +964,21 @@ module.exports = async function registerCommerceRoutes({
       const mergeId = requireId(req.body?.mergeId);
       const guestItems = req.body?.items;
 
-      // ======================================
-      // VALIDATE GUEST CART
-      // ======================================
-
       if (!Array.isArray(guestItems) || guestItems.length > LIMIT_ITEMS) {
         fail("Invalid guest cart", 400);
       }
 
-      // Revalidate each product using MongoDB.
-      // Never trust guest-side prices.
-
       const validated = await Promise.all(guestItems.map(buildCartLine));
-
-      // ======================================
-      // MERGE STATUS
-      // ======================================
 
       let alreadyMerged = false;
 
-      // ======================================
-      // ATOMIC CART MERGE
-      // ======================================
-
       await mutateCart(req.user.uid, (cart) => {
-        // Same mergeId already processed.
-        // Do not merge the products again.
-
         if (cart.mergeIds.includes(mergeId)) {
           alreadyMerged = true;
           return null;
         }
 
-        // This is a new merge attempt.
-        // Reset when mutateCart retries.
-
         alreadyMerged = false;
-
-        // ====================================
-        // MERGE VALIDATED ITEMS
-        // ====================================
 
         for (const line of validated) {
           const present = cart.items.some(
@@ -1147,52 +991,33 @@ module.exports = async function registerCommerceRoutes({
           }
         }
 
-        // ====================================
-        // SAVE PROCESSED MERGE ID
-        // ====================================
-
         cart.mergeIds = [...cart.mergeIds, mergeId].slice(-50);
 
         return cart;
       });
 
-      // ======================================
-      // RESPONSE
-      // ======================================
-
       res.set("Cache-Control", "no-store");
 
       return res.status(200).json({
         success: true,
-
         message: alreadyMerged
           ? "Guest cart already merged"
           : "Guest cart merged successfully",
-
         alreadyMerged,
-
         cart: await viewCart(req.user.uid),
       });
     }),
   );
 
-  // =========================================
-  // VALIDATE CUSTOMER
-  // =========================================
+  // Part 3 — Checkout, Profile ও Payment Validation
 
   const validateCustomer = (value) => {
     const input = value || {};
-
     const name = str(input.name, 150);
-
     const phone = str(input.phone, 30).replace(/\s/g, "");
-
     const address = str(input.address, 500);
-
     const note = str(input.note, 1000);
-
     const email = str(input.email, 200);
-
     const { division, district } = region(input);
 
     if (
@@ -1207,37 +1032,11 @@ module.exports = async function registerCommerceRoutes({
       fail("Invalid email");
     }
 
-    return {
-      name,
-      phone,
-      email,
-      address,
-      division,
-      district,
-      note,
-    };
+    return { name, phone, email, address, division, district, note };
   };
-
-  // ============================================
-  // SAVED CHECKOUT PROFILE
-  // Add INSIDE registerCommerceRoutes()
-  // AFTER validateCustomer, BEFORE calculateQuote
-  //
-  // Existing variables used:
-  // app, users, orders,
-  // verifyFirebaseToken, activeAccount,
-  // handle, validateCustomer, fail
-  // ============================================
 
   const cleanProfileString = (value) =>
     typeof value === "string" ? value.trim() : "";
-
-  // Database first:
-  // 1. Saved checkout profile
-  // 2. Customer's latest authenticated order
-  // 3. Registered account name and phone
-  //
-  // Never expose order payment information here.
 
   const checkoutProfileView = async (account) => {
     const saved = account.checkoutProfile || {};
@@ -1246,10 +1045,7 @@ module.exports = async function registerCommerceRoutes({
       { uid: account.uid },
       {
         sort: { createdAt: -1 },
-        projection: {
-          _id: 0,
-          customer: 1,
-        },
+        projection: { _id: 0, customer: 1 },
       },
     );
 
@@ -1280,20 +1076,12 @@ module.exports = async function registerCommerceRoutes({
 
     return {
       name: pick(saved.name, previous.name, account.displayName),
-
       phone: pick(saved.phone, previous.phone, account.phone),
-
       division,
       district,
-
       address: pick(saved.address, previous.address),
     };
   };
-
-  // ============================================
-  // GET /checkout/profile
-  // Fetch only signed-in user's own profile.
-  // ============================================
 
   app.get(
     "/checkout/profile",
@@ -1301,10 +1089,7 @@ module.exports = async function registerCommerceRoutes({
     activeAccount,
     handle(async (req, res) => {
       const account = await users.findOne(
-        {
-          uid: req.user.uid,
-          status: "active",
-        },
+        { uid: req.user.uid, status: "active" },
         {
           projection: {
             uid: 1,
@@ -1315,28 +1100,14 @@ module.exports = async function registerCommerceRoutes({
         },
       );
 
-      if (!account) {
-        fail("Account unavailable", 403);
-      }
+      if (!account) fail("Account unavailable", 403);
 
       const profile = await checkoutProfileView(account);
-
       res.set("Cache-Control", "no-store");
 
-      return res.json({
-        success: true,
-        profile,
-      });
+      return res.json({ success: true, profile });
     }),
   );
-
-  // ============================================
-  // POST /checkout/profile/merge-guest
-  //
-  // Fills only missing checkoutProfile fields.
-  // Does not replace existing DB values.
-  // Does not touch user role/email/payment.
-  // ============================================
 
   const checkoutProfileMergeLimit = limit(12, "Too many profile sync requests");
 
@@ -1348,9 +1119,6 @@ module.exports = async function registerCommerceRoutes({
     handle(async (req, res) => {
       const guest = req.body?.profile;
 
-      // Revalidate browser-stored data.
-      // localStorage is untrusted input.
-
       const validated = validateCustomer({
         name: guest?.name,
         phone: guest?.phone,
@@ -1361,10 +1129,7 @@ module.exports = async function registerCommerceRoutes({
       });
 
       const account = await users.findOne(
-        {
-          uid: req.user.uid,
-          status: "active",
-        },
+        { uid: req.user.uid, status: "active" },
         {
           projection: {
             uid: 1,
@@ -1375,27 +1140,17 @@ module.exports = async function registerCommerceRoutes({
         },
       );
 
-      if (!account) {
-        fail("Account unavailable", 403);
-      }
+      if (!account) fail("Account unavailable", 403);
 
       const dbProfile = await checkoutProfileView(account);
 
-      // If a value already exists in MongoDB or
-      // a previous account order, prefer that.
       const candidate = {
         name: dbProfile.name || validated.name,
         phone: dbProfile.phone || validated.phone,
-
         division: dbProfile.division || validated.division,
-
         district: dbProfile.district || validated.district,
-
         address: dbProfile.address || validated.address,
       };
-
-      // Atomic update: a concurrent request cannot
-      // replace existing nonblank profile fields.
 
       const blank = (path) => ({
         $eq: [{ $ifNull: [path, ""] }, ""],
@@ -1409,72 +1164,52 @@ module.exports = async function registerCommerceRoutes({
         ],
       });
 
-      // Division/District must remain a valid pair.
-      // Never mix districts from unrelated divisions.
-
       const compatibleRegion = {
         $and: [
           {
             $in: [
-              {
-                $ifNull: ["$checkoutProfile.division", ""],
-              },
+              { $ifNull: ["$checkoutProfile.division", ""] },
               ["", candidate.division],
             ],
           },
           {
             $in: [
-              {
-                $ifNull: ["$checkoutProfile.district", ""],
-              },
+              { $ifNull: ["$checkoutProfile.district", ""] },
               ["", candidate.district],
             ],
           },
         ],
       };
 
-      await users.updateOne(
+      await users.updateOne({ uid: req.user.uid, status: "active" }, [
         {
-          uid: req.user.uid,
-          status: "active",
-        },
-        [
-          {
-            $set: {
-              "checkoutProfile.name": fillOnlyBlank("name", candidate.name),
-
-              "checkoutProfile.phone": fillOnlyBlank("phone", candidate.phone),
-
-              "checkoutProfile.address": fillOnlyBlank(
-                "address",
-                candidate.address,
-              ),
-
-              "checkoutProfile.division": {
-                $cond: [
-                  compatibleRegion,
-                  fillOnlyBlank("division", candidate.division),
-                  "$checkoutProfile.division",
-                ],
-              },
-
-              "checkoutProfile.district": {
-                $cond: [
-                  compatibleRegion,
-                  fillOnlyBlank("district", candidate.district),
-                  "$checkoutProfile.district",
-                ],
-              },
+          $set: {
+            "checkoutProfile.name": fillOnlyBlank("name", candidate.name),
+            "checkoutProfile.phone": fillOnlyBlank("phone", candidate.phone),
+            "checkoutProfile.address": fillOnlyBlank(
+              "address",
+              candidate.address,
+            ),
+            "checkoutProfile.division": {
+              $cond: [
+                compatibleRegion,
+                fillOnlyBlank("division", candidate.division),
+                "$checkoutProfile.division",
+              ],
+            },
+            "checkoutProfile.district": {
+              $cond: [
+                compatibleRegion,
+                fillOnlyBlank("district", candidate.district),
+                "$checkoutProfile.district",
+              ],
             },
           },
-        ],
-      );
+        },
+      ]);
 
       const fresh = await users.findOne(
-        {
-          uid: req.user.uid,
-          status: "active",
-        },
+        { uid: req.user.uid, status: "active" },
         {
           projection: {
             uid: 1,
@@ -1494,10 +1229,6 @@ module.exports = async function registerCommerceRoutes({
     }),
   );
 
-  // =========================================
-  // SERVER-SIDE CHECKOUT QUOTE
-  // =========================================
-
   const calculateQuote = async ({
     items,
     customer,
@@ -1512,9 +1243,7 @@ module.exports = async function registerCommerceRoutes({
       fail("Invalid checkout items");
     }
 
-    if (couponCode) {
-      fail("Coupons are not enabled");
-    }
+    if (couponCode) fail("Coupons are not enabled");
 
     const lines = await Promise.all(items.map(buildCartLine));
 
@@ -1524,7 +1253,6 @@ module.exports = async function registerCommerceRoutes({
       if (unique.has(line.signature)) {
         fail("Duplicate configuration in checkout");
       }
-
       unique.add(line.signature);
     }
 
@@ -1533,87 +1261,67 @@ module.exports = async function registerCommerceRoutes({
     );
 
     const { district } = region(customer);
-
     const deliveryCharge = district === "নরসিংদী" ? 80 : 130;
 
     const options = giftOptions ?? {};
 
     if (typeof options !== "object" || Array.isArray(options)) {
-      fail("Invalid gift options", 400);
+      fail("Invalid gift options");
     }
 
-    if (
-      options.giftWrap !== undefined &&
-      typeof options.giftWrap !== "boolean"
-    ) {
-      fail("Invalid giftWrap", 400);
-    }
-
-    if (
-      options.surpriseBox !== undefined &&
-      typeof options.surpriseBox !== "boolean"
-    ) {
-      fail("Invalid surpriseBox", 400);
-    }
-
-    const giftWrap = options.giftWrap === true;
-    const surpriseBox = options.surpriseBox === true;
-
-    const giftWrapCharge = giftWrap ? 50 : 0;
+    const giftWrapCharge = 0;
     const message = str(options.message, 250);
-
-    const total = currency(subtotal + deliveryCharge + giftWrapCharge);
+    const total = currency(subtotal + deliveryCharge);
 
     return {
       items: lines,
       subtotal,
       deliveryCharge,
       giftWrapCharge,
-
-      giftOptions: {
-        giftWrap,
-        surpriseBox,
-        message,
-      },
-
+      giftOptions: { message },
       discount: 0,
       total,
     };
   };
 
-  // =========================================
-  // VALIDATE PAYMENT
-  // =========================================
-
   const validatePayment = (input, total) => {
     const payment = input || {};
-
     const method = str(payment.method, 20).toLowerCase();
 
     if (!["bkash", "nagad", "rocket", "cod"].includes(method)) {
       fail("Invalid payment method");
     }
 
+    const base = {
+      method,
+      verifiedAmount: 0,
+      onlineVerifiedAmount: 0,
+      dueAmount: currency(total),
+      excessAmount: 0,
+      cashCollected: 0,
+      deliveryCollections: [],
+      refundedAmount: 0,
+      refunds: [],
+      cancellationRefund: null,
+      excessResolution: null,
+      verifiedAt: null,
+      verifiedBy: null,
+      rejectedReason: null,
+      reviews: [],
+    };
+
     if (method === "cod") {
       return {
-        method,
+        ...base,
         status: "cod_pending",
-
         senderPhone: null,
-
         trxId: null,
-
         claimedAmount: 0,
-
-        verifiedAmount: 0,
-
-        dueAmount: total,
-
-        verifiedAt: null,
-
-        verifiedBy: null,
-
-        rejectedReason: null,
+        note: "",
+        claimDifference: {
+          type: "cod",
+          amount: currency(total),
+        },
       };
     }
 
@@ -1621,44 +1329,32 @@ module.exports = async function registerCommerceRoutes({
 
     const trxId = str(payment.trxId, 60).toUpperCase();
 
-    if (
-      !/^01[3-9]\d{8}$/.test(senderPhone) ||
-      !/^[A-Z0-9_-]{5,60}$/.test(trxId)
-    ) {
-      fail("Invalid sender phone or TrxID");
+    if (!/^01[3-9]\d{8}$/.test(senderPhone)) {
+      fail("Invalid sender phone");
+    }
+
+    if (!/^[A-Z0-9_-]{5,60}$/.test(trxId)) {
+      fail("Invalid Transaction ID");
     }
 
     const claimedAmount = parseAmount(payment.amount, "payment amount");
 
-    if (claimedAmount > total) {
-      fail("Claimed amount exceeds order total");
-    }
+    const difference = currency(claimedAmount - total);
 
     return {
-      method,
+      ...base,
       status: "pending",
-
       senderPhone,
       trxId,
       claimedAmount,
-
       note: str(payment.note, 200),
-
-      verifiedAmount: 0,
-
-      dueAmount: total,
-
-      verifiedAt: null,
-
-      verifiedBy: null,
-
-      rejectedReason: null,
+      claimDifference: {
+        type:
+          difference < 0 ? "underpaid" : difference > 0 ? "overpaid" : "exact",
+        amount: Math.abs(difference),
+      },
     };
   };
-
-  // =========================================
-  // POST /checkout/quote
-  // =========================================
 
   app.post(
     "/checkout/quote",
@@ -1674,9 +1370,6 @@ module.exports = async function registerCommerceRoutes({
       });
     }),
   );
-  // =========================================
-  // GUEST IDEMPOTENCY RESPONSE
-  // =========================================
 
   const answerExisting = (req, res, existing, checkoutId) => {
     const sameOwner = req.user?.uid && existing.uid === req.user.uid;
@@ -1694,26 +1387,17 @@ module.exports = async function registerCommerceRoutes({
 
     return res.json({
       success: true,
-
       alreadyCreated: true,
-
       orderId: existing._id.toString(),
-
       orderNumber: existing.orderNumber,
-
       status: existing.status,
-
       paymentStatus: existing.payment?.status,
-
       total: existing.total,
-
       accessToken: sameGuest ? token : null,
     });
   };
 
-  // =========================================
-  // POST /orders
-  // =========================================
+  // Part 4 — Order Creation, History, Tracking ও Payment Proof
 
   app.post(
     "/orders",
@@ -1722,10 +1406,7 @@ module.exports = async function registerCommerceRoutes({
     customerOrGuest,
     handle(async (req, res) => {
       const checkoutId = checkoutIdOf(req.body.checkoutId);
-
-      const previous = await orders.findOne({
-        checkoutId,
-      });
+      const previous = await orders.findOne({ checkoutId });
 
       if (previous) {
         return answerExisting(req, res, previous, checkoutId);
@@ -1740,9 +1421,7 @@ module.exports = async function registerCommerceRoutes({
           status: "active",
         });
 
-        if (!account) {
-          fail("Active account required", 403);
-        }
+        if (!account) fail("Active account required", 403);
       }
 
       const customer = validateCustomer(req.body.customer);
@@ -1753,16 +1432,12 @@ module.exports = async function registerCommerceRoutes({
 
       const quote = await calculateQuote({
         items: req.body.items,
-
         customer,
-
         giftOptions: req.body.giftOptions,
-
         couponCode: req.body.couponCode,
       });
 
       const payment = validatePayment(req.body.payment, quote.total);
-
       const now = new Date();
 
       const orderNumber =
@@ -1774,62 +1449,42 @@ module.exports = async function registerCommerceRoutes({
       const order = {
         checkoutId,
         orderNumber,
-
         uid: account?.uid || null,
-
         guest: !account,
-
         customer,
 
         shipping: {
           recipientName: customer.name,
-
           phone: customer.phone,
-
           division: customer.division,
-
           district: customer.district,
-
           address: customer.address,
-
           note: customer.note,
         },
 
         items: quote.items.map((line) => ({
           ...line,
-
           lineTotal: currency(line.unitPrice * line.quantity),
         })),
 
         subtotal: quote.subtotal,
-
         deliveryCharge: quote.deliveryCharge,
-
         giftWrapCharge: quote.giftWrapCharge,
-
         giftOptions: quote.giftOptions,
-
         discount: 0,
-
         total: quote.total,
-
         payment,
 
         ...(payment.trxId
-          ? {
-              paymentTrxIds: [`${payment.method}:${payment.trxId}`],
-            }
+          ? { paymentTrxIds: [`${payment.method}:${payment.trxId}`] }
           : {}),
 
         status: "pending",
-
         phoneConfirmed: false,
 
         courier: {
           name: null,
-
           trackingNumber: null,
-
           trackingUrl: null,
         },
 
@@ -1838,11 +1493,8 @@ module.exports = async function registerCommerceRoutes({
         history: [
           {
             status: "placed",
-
             date: now,
-
             note: "Order successfully placed",
-
             by: "system",
           },
         ],
@@ -1850,9 +1502,7 @@ module.exports = async function registerCommerceRoutes({
         guestTokenHash: accessToken ? digest(accessToken) : null,
 
         revision: 1,
-
         createdAt: now,
-
         updatedAt: now,
       };
 
@@ -1862,9 +1512,7 @@ module.exports = async function registerCommerceRoutes({
         result = await orders.insertOne(order);
       } catch (error) {
         if (error.code === 11000) {
-          const first = await orders.findOne({
-            checkoutId,
-          });
+          const first = await orders.findOne({ checkoutId });
 
           if (first) {
             return answerExisting(req, res, first, checkoutId);
@@ -1876,21 +1524,10 @@ module.exports = async function registerCommerceRoutes({
         throw error;
       }
 
-      // ============================================
-      // SAVE LAST SUCCESSFUL CHECKOUT DETAILS
-      // Registered customer only
-      //
-      // Place AFTER successful orders.insertOne()
-      // and BEFORE account cart cleanup.
-      // ============================================
-
       if (account) {
         try {
           await users.updateOne(
-            {
-              uid: account.uid,
-              status: "active",
-            },
+            { uid: account.uid, status: "active" },
             {
               $set: {
                 checkoutProfile: {
@@ -1905,17 +1542,12 @@ module.exports = async function registerCommerceRoutes({
             },
           );
         } catch (profileError) {
-          // Order already exists; never create another
-          // order just because profile saving failed.
           console.error(
             "Checkout profile update failed:",
             profileError.message,
           );
         }
       }
-
-      // Remove purchased items from account cart.
-      // Do not clear unrelated cart items.
 
       if (account) {
         try {
@@ -1933,14 +1565,7 @@ module.exports = async function registerCommerceRoutes({
 
               const remaining = line.quantity - boughtLine.quantity;
 
-              return remaining > 0
-                ? [
-                    {
-                      ...line,
-                      quantity: remaining,
-                    },
-                  ]
-                : [];
+              return remaining > 0 ? [{ ...line, quantity: remaining }] : [];
             });
 
             return cart;
@@ -1954,27 +1579,16 @@ module.exports = async function registerCommerceRoutes({
 
       res.status(201).json({
         success: true,
-
         message: "Order placed successfully",
-
         orderId: result.insertedId.toString(),
-
         orderNumber,
-
         status: "pending",
-
         paymentStatus: payment.status,
-
         total: quote.total,
-
         accessToken,
       });
     }),
   );
-
-  // =========================================
-  // SECURE ORDER ACCESS
-  // =========================================
 
   const canReadOrder = (req, order, token) => {
     if (order.uid && req.user?.uid === order.uid) {
@@ -1999,31 +1613,10 @@ module.exports = async function registerCommerceRoutes({
     );
   };
 
-  // =========================================
-  // GET /orders/my
-  // =========================================
-
-  // ============================================
-  // CUSTOMER ORDER HISTORY
-  // GET /orders/my
-  //
-  // Security:
-  // - Firebase verified identity only
-  // - UID always comes from req.user
-  // - No customer-supplied UID accepted
-  // - Filter validation and pagination limits
-  // - Minimal list response
-  // - No phone, address, TrxID or customization
-  // ============================================
-
   app.get(
     "/orders/my",
     verifyFirebaseToken,
     handle(async (req, res) => {
-      // ========================================
-      // AUTHENTICATION
-      // ========================================
-
       const uid = req.user?.uid;
 
       if (!uid) {
@@ -2032,10 +1625,6 @@ module.exports = async function registerCommerceRoutes({
           message: "Authentication required",
         });
       }
-
-      // Respect explicitly suspended accounts.
-      // Accounts with legacy missing status
-      // can still access their own order history.
 
       const account = await users.findOne(
         { uid },
@@ -2056,10 +1645,6 @@ module.exports = async function registerCommerceRoutes({
         });
       }
 
-      // ========================================
-      // PAGINATION VALIDATION
-      // ========================================
-
       const rawPage = req.query.page === undefined ? "1" : req.query.page;
 
       if (
@@ -2071,14 +1656,8 @@ module.exports = async function registerCommerceRoutes({
       }
 
       const page = Math.min(10000, Number(rawPage));
-
       const perPage = 10;
-
       const skip = (page - 1) * perPage;
-
-      // ========================================
-      // SAFE QUERY PARAMETERS
-      // ========================================
 
       const readFilter = (value, maxLength = 60) => {
         if (value === undefined) return "";
@@ -2101,10 +1680,6 @@ module.exports = async function registerCommerceRoutes({
         .replace(/^#/, "")
         .toUpperCase();
 
-      // ========================================
-      // STATUS ALLOWLIST
-      // ========================================
-
       const allowedOrderStatuses = new Set([
         "pending",
         "verified",
@@ -2118,6 +1693,7 @@ module.exports = async function registerCommerceRoutes({
       const allowedPaymentStatuses = new Set([
         "pending",
         "cod_pending",
+        "cod_collected",
         "partially_paid",
         "verified",
         "rejected",
@@ -2135,20 +1711,11 @@ module.exports = async function registerCommerceRoutes({
         fail("Invalid payment status filter", 400);
       }
 
-      // Order numbers consist of uppercase
-      // alphanumeric characters and hyphens.
-
       if (search && !/^[A-Z0-9-]{1,60}$/.test(search)) {
         fail("Invalid order number search", 400);
       }
 
-      // ========================================
-      // OWNER-SCOPED MONGODB QUERY
-      // ========================================
-
-      const query = {
-        uid,
-      };
+      const query = { uid };
 
       if (status && status !== "all") {
         query.status = status;
@@ -2159,16 +1726,8 @@ module.exports = async function registerCommerceRoutes({
       }
 
       if (search) {
-        // Safe prefix search.
-        // No arbitrary regex operators are
-        // accepted from the frontend.
-
         query.orderNumber = new RegExp(`^${search}`);
       }
-
-      // ========================================
-      // MINIMAL FIELD PROJECTION
-      // ========================================
 
       const projection = {
         _id: 1,
@@ -2176,61 +1735,35 @@ module.exports = async function registerCommerceRoutes({
         createdAt: 1,
         status: 1,
         total: 1,
-
         "payment.method": 1,
         "payment.status": 1,
-
         "items.name": 1,
         "items.image": 1,
         "items.quantity": 1,
       };
 
-      // ========================================
-      // DATABASE QUERIES
-      // ========================================
-
       const [orderDocuments, filteredTotal, statusCounts] = await Promise.all([
-        // Current page
-
         orders
           .find(query, { projection })
-          .sort({
-            createdAt: -1,
-            _id: -1,
-          })
+          .sort({ createdAt: -1, _id: -1 })
           .skip(skip)
           .limit(perPage)
           .toArray(),
 
-        // Total after filters
-
         orders.countDocuments(query),
-
-        // Stats across ALL current user's
-        // orders, independent of filters.
 
         orders
           .aggregate([
-            {
-              $match: {
-                uid,
-              },
-            },
+            { $match: { uid } },
             {
               $group: {
                 _id: "$status",
-                count: {
-                  $sum: 1,
-                },
+                count: { $sum: 1 },
               },
             },
           ])
           .toArray(),
       ]);
-
-      // ========================================
-      // FORMAT ORDER LIST
-      // ========================================
 
       const formattedOrders = orderDocuments.map((order) => {
         const items = Array.isArray(order.items) ? order.items : [];
@@ -2249,15 +1782,12 @@ module.exports = async function registerCommerceRoutes({
         return {
           _id: order._id.toString(),
           orderNumber: order.orderNumber,
-
           createdAt: order.createdAt,
           status: order.status,
-
           total: Number(order.total) || 0,
 
           payment: {
             method: order.payment?.method || null,
-
             status: order.payment?.status || null,
           },
 
@@ -2265,10 +1795,6 @@ module.exports = async function registerCommerceRoutes({
           previewItems,
         };
       });
-
-      // ========================================
-      // FORMAT STATISTICS
-      // ========================================
 
       const counts = Object.fromEntries(
         statusCounts.map((item) => [item._id, item.count]),
@@ -2281,52 +1807,32 @@ module.exports = async function registerCommerceRoutes({
 
       const stats = {
         total: totalOrders,
-
         pending: counts.pending || 0,
-
         verified: counts.verified || 0,
-
         processing: counts.processing || 0,
-
         shipped: counts.shipped || 0,
-
         delivered: counts.delivered || 0,
-
         cancelled: (counts.cancelled || 0) + (counts.rejected || 0),
       };
-
-      // ========================================
-      // RESPONSE
-      // ========================================
 
       res.set("Cache-Control", "no-store");
 
       return res.status(200).json({
         success: true,
-
         orders: formattedOrders,
-
         stats,
 
         pagination: {
           page,
           limit: perPage,
-
           total: filteredTotal,
-
           totalPages: Math.ceil(filteredTotal / perPage),
-
           hasNextPage: page * perPage < filteredTotal,
-
           hasPreviousPage: page > 1,
         },
       });
     }),
   );
-
-  // =========================================
-  // POST /orders/lookup
-  // =========================================
 
   app.post(
     "/orders/lookup",
@@ -2350,15 +1856,10 @@ module.exports = async function registerCommerceRoutes({
 
       res.json({
         success: true,
-
         order: viewOrder(order),
       });
     }),
   );
-
-  // =========================================
-  // POST /orders/public/track
-  // =========================================
 
   app.post(
     "/orders/public/track",
@@ -2371,7 +1872,6 @@ module.exports = async function registerCommerceRoutes({
       const deny = () =>
         res.status(404).json({
           success: false,
-
           message: "Order not found or access denied",
         });
 
@@ -2381,33 +1881,25 @@ module.exports = async function registerCommerceRoutes({
 
       const order = await orders.findOne({
         ...orderFilter(identifier),
-
         "customer.phone": phone,
       });
 
-      if (!order) {
-        return deny();
-      }
+      if (!order) return deny();
 
       res.set("Cache-Control", "no-store");
 
       res.json({
         success: true,
-
         visibility: "limited",
 
         order: {
           orderNumber: order.orderNumber,
-
           createdAt: order.createdAt,
-
           status: order.status,
-
           phoneConfirmed: order.phoneConfirmed === true,
 
           payment: {
             method: order.payment?.method || null,
-
             status: order.payment?.status || null,
           },
 
@@ -2415,17 +1907,12 @@ module.exports = async function registerCommerceRoutes({
 
           history: (order.history || []).slice(-15).map((h) => ({
             status: h.status,
-
             date: h.date,
           })),
         },
       });
     }),
   );
-
-  // =========================================
-  // GET /orders/:identifier
-  // =========================================
 
   app.get(
     "/orders/:identifier",
@@ -2444,42 +1931,32 @@ module.exports = async function registerCommerceRoutes({
 
       res.json({
         success: true,
-
         order: viewOrder(order),
       });
     }),
   );
 
-  // =========================================
-  // ATOMIC ORDER UPDATE
-  // =========================================
-
   const updateOrder = async (identifier, buildChange) => {
     for (let i = 0; i < 8; i++) {
       const previous = await orders.findOne(orderFilter(identifier));
 
-      if (!previous) {
-        fail("Order not found", 404);
-      }
+      if (!previous) fail("Order not found", 404);
 
       const change = await buildChange(previous);
 
-      if (!change?.set) {
-        fail("No changes supplied");
-      }
+      if (change?.noop === true) return previous;
+      if (!change?.set) fail("No changes supplied");
 
       const now = new Date();
 
       const result = await orders.updateOne(
         {
           _id: previous._id,
-
           revision: previous.revision,
         },
         {
           $set: {
             ...change.set,
-
             updatedAt: now,
           },
 
@@ -2490,11 +1967,8 @@ module.exports = async function registerCommerceRoutes({
           $push: {
             history: {
               status: change.event,
-
               note: change.note || "",
-
               by: change.by || "system",
-
               date: now,
             },
           },
@@ -2511,187 +1985,89 @@ module.exports = async function registerCommerceRoutes({
     fail("Order changed concurrently; retry", 409);
   };
 
-  // =========================================
-  // POST /orders/:identifier/payment-proof
-  // =========================================
-
   app.post(
     "/orders/:identifier/payment-proof",
     proofLimit,
     optionalAuth,
     handle(async (req, res) => {
-      const updated = await updateOrder(
-        req.params.identifier,
+      const updated = await updateOrder(req.params.identifier, (order) => {
+        if (!canReadOrder(req, order, req.headers["x-order-access-token"])) {
+          fail("Access denied", 403);
+        }
 
-        (order) => {
-          if (!canReadOrder(req, order, req.headers["x-order-access-token"])) {
-            fail("Access denied", 403);
-          }
+        if (
+          order.payment.method === "cod" ||
+          order.payment.status !== "rejected" ||
+          order.status !== "rejected"
+        ) {
+          fail("Cannot resubmit payment for this order", 409);
+        }
 
-          if (
-            order.payment.method === "cod" ||
-            order.payment.status !== "rejected" ||
-            order.status !== "rejected"
-          ) {
-            fail("Cannot resubmit payment for this order", 409);
-          }
+        const payment = validatePayment(
+          {
+            ...req.body,
+            method: order.payment.method,
+          },
+          order.total,
+        );
 
-          const payment = validatePayment(
-            {
-              ...req.body,
+        const verified = currency(order.payment.verifiedAmount || 0);
 
-              method: order.payment.method,
-            },
+        const trxKey = `${payment.method}:${payment.trxId}`;
 
-            order.total,
-          );
+        if ((order.paymentTrxIds || []).includes(trxKey)) {
+          fail("Previously submitted TrxID", 409);
+        }
 
-          const verified = currency(order.payment.verifiedAmount || 0);
+        return {
+          set: {
+            payment: {
+              ...payment,
+              verifiedAmount: verified,
 
-          if (payment.claimedAmount > currency(order.total - verified)) {
-            fail("Claim exceeds remaining due");
-          }
+              onlineVerifiedAmount: onlineReceived(order.payment),
 
-          const trxKey = `${payment.method}:${payment.trxId}`;
+              dueAmount: Math.max(0, currency(order.total - verified)),
 
-          if ((order.paymentTrxIds || []).includes(trxKey)) {
-            fail("Previously submitted TrxID", 409);
-          }
+              excessAmount: Math.max(0, currency(verified - order.total)),
 
-          return {
-            set: {
-              payment: {
-                ...payment,
+              cashCollected: currency(order.payment.cashCollected || 0),
 
-                verifiedAmount: verified,
+              deliveryCollections: order.payment.deliveryCollections || [],
 
-                dueAmount: currency(order.total - verified),
+              refundedAmount: currency(order.payment.refundedAmount || 0),
 
-                status: verified > 0 ? "partially_paid" : "pending",
-              },
+              refunds: order.payment.refunds || [],
 
-              paymentTrxIds: [...(order.paymentTrxIds || []), trxKey],
+              cancellationRefund: order.payment.cancellationRefund || null,
 
+              reviews: order.payment.reviews || [],
+              excessResolution: null,
               status: "pending",
             },
 
-            event: "payment_resubmitted",
+            paymentTrxIds: [...(order.paymentTrxIds || []), trxKey],
 
-            note: "Customer resubmitted payment proof",
+            phoneConfirmed: false,
+            status: "pending",
+          },
 
-            by: order.uid || "guest",
-          };
-        },
-      );
+          event: "payment_resubmitted",
+          note: "Customer resubmitted payment proof",
+          by: order.uid || "guest",
+        };
+      });
 
       res.set("Cache-Control", "no-store");
 
       res.json({
         success: true,
-
         order: viewOrder(updated),
       });
     }),
   );
 
-  // =========================================
-  // ADMIN ORDER/PAYMENT LISTS
-  // =========================================
-
-  const listAdmin = (kind) => [
-    verifyFirebaseToken,
-
-    verifyAdmin,
-
-    handle(async (req, res) => {
-      const page = Math.min(
-        10000,
-
-        Math.max(
-          1,
-
-          parseInt(req.query.page, 10) || 1,
-        ),
-      );
-
-      const filter = {};
-
-      const status = str(req.query.status, 40);
-
-      const method = str(req.query.method, 20);
-
-      const search = str(req.query.search, 100);
-
-      if (status && status !== "all") {
-        filter[kind === "payments" ? "payment.status" : "status"] = status;
-      }
-
-      if (method && method !== "all" && kind === "payments") {
-        filter["payment.method"] = method;
-      }
-
-      if (search && kind === "orders") {
-        const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-        const rx = new RegExp(escaped, "i");
-
-        filter.$or = [
-          {
-            orderNumber: rx,
-          },
-
-          {
-            "customer.name": rx,
-          },
-
-          {
-            "customer.phone": rx,
-          },
-
-          {
-            "payment.trxId": rx,
-          },
-        ];
-      }
-
-      const [docs, total] = await Promise.all([
-        orders
-          .find(filter)
-          .sort({
-            createdAt: -1,
-          })
-          .skip((page - 1) * 10)
-          .limit(10)
-          .toArray(),
-
-        orders.countDocuments(filter),
-      ]);
-
-      res.set("Cache-Control", "no-store");
-
-      res.json({
-        success: true,
-
-        [kind]: docs.map(viewOrder),
-
-        pagination: {
-          page,
-
-          limit: 10,
-
-          total,
-
-          totalPages: Math.ceil(total / 10),
-        },
-      });
-    }),
-  ];
-
-  // ==========================================
-  // ADMIN ORDERS LIST
-  // Guest + Customer
-  // Search, Filter, Pagination, Global Stats
-  // ==========================================
+  // Part 5 — Admin Orders, Payments ও Private Notes
 
   app.get(
     "/admin/orders",
@@ -2702,7 +2078,6 @@ module.exports = async function registerCommerceRoutes({
         10000,
         Math.max(1, parseInt(req.query.page, 10) || 1),
       );
-
       const perPage = 10;
 
       const status = str(req.query.status, 30).toLowerCase();
@@ -2745,10 +2120,6 @@ module.exports = async function registerCommerceRoutes({
         filter["payment.method"] = method;
       }
 
-      // ======================================
-      // SEARCH
-      // ======================================
-
       if (search) {
         const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -2771,10 +2142,6 @@ module.exports = async function registerCommerceRoutes({
           });
         }
       }
-
-      // ======================================
-      // DATE — DHAKA TIMEZONE
-      // ======================================
 
       if (date && date !== "all") {
         const now = new Date();
@@ -2804,11 +2171,6 @@ module.exports = async function registerCommerceRoutes({
         };
       }
 
-      // ======================================
-      // GLOBAL STATS
-      // Not limited to current page
-      // ======================================
-
       const [documents, filteredTotal, statusRows, custom] = await Promise.all([
         orders
           .find(filter, {
@@ -2818,10 +2180,7 @@ module.exports = async function registerCommerceRoutes({
               paymentTrxIds: 0,
             },
           })
-          .sort({
-            createdAt: -1,
-            _id: -1,
-          })
+          .sort({ createdAt: -1, _id: -1 })
           .skip((page - 1) * perPage)
           .limit(perPage)
           .toArray(),
@@ -2867,21 +2226,15 @@ module.exports = async function registerCommerceRoutes({
 
       const stats = {
         total: counts.all,
-
         active:
           (counts.pending || 0) +
           (counts.verified || 0) +
           (counts.processing || 0) +
           (counts.shipped || 0),
-
         pending: counts.pending || 0,
         custom,
         transit: counts.shipped || 0,
       };
-
-      // ========================================
-      // LOAD CUSTOMER PROFILE PHOTOS
-      // ========================================
 
       const customerUids = [
         ...new Set(
@@ -2891,13 +2244,10 @@ module.exports = async function registerCommerceRoutes({
         ),
       ];
 
-      // Uses existing MongoDB users collection.
       const customerAccounts = customerUids.length
         ? await users
             .find(
-              {
-                uid: { $in: customerUids },
-              },
+              { uid: { $in: customerUids } },
               {
                 projection: {
                   uid: 1,
@@ -2939,13 +2289,10 @@ module.exports = async function registerCommerceRoutes({
 
           return {
             ...orderData,
-
             _id: order._id.toString(),
-
             customerPhotoUrl: order.guest
               ? ""
               : customerPhotoMap.get(uid) || "",
-
             itemCount,
           };
         }),
@@ -2965,12 +2312,6 @@ module.exports = async function registerCommerceRoutes({
     }),
   );
 
-  // ==========================================
-  // ADMIN PAYMENT LIST
-  // Guest + Registered Customer
-  // Search + Filters + Stats + Pagination
-  // ==========================================
-
   app.get(
     "/admin/payments",
     verifyFirebaseToken,
@@ -2982,7 +2323,6 @@ module.exports = async function registerCommerceRoutes({
       );
 
       const limit = 10;
-
       const status = str(req.query.status, 30).toLowerCase();
       const method = str(req.query.method, 20).toLowerCase();
       const date = str(req.query.date, 20).toLowerCase();
@@ -3013,8 +2353,6 @@ module.exports = async function registerCommerceRoutes({
         fail("Invalid date filter");
       }
 
-      // COD is managed separately.
-      // Never count COD as verified online payment.
       const onlineFilter = {
         "payment.method": {
           $in: ["bkash", "nagad", "rocket"],
@@ -3022,10 +2360,6 @@ module.exports = async function registerCommerceRoutes({
       };
 
       const filter = { ...onlineFilter };
-
-      // ======================================
-      // PAYMENT STATUS
-      // ======================================
 
       if (status === "pending") {
         filter["payment.status"] = {
@@ -3035,17 +2369,9 @@ module.exports = async function registerCommerceRoutes({
         filter["payment.status"] = status;
       }
 
-      // ======================================
-      // PAYMENT METHOD
-      // ======================================
-
       if (method && method !== "all") {
         filter["payment.method"] = method;
       }
-
-      // ======================================
-      // SEARCH
-      // ======================================
 
       if (search) {
         const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -3069,10 +2395,6 @@ module.exports = async function registerCommerceRoutes({
 
         filter.$or = searchConditions;
       }
-
-      // ======================================
-      // DATE FILTER — ASIA/DHAKA UTC+06
-      // ======================================
 
       if (date && date !== "all") {
         const dhakaNow = new Date(Date.now() + 6 * 60 * 60 * 1000);
@@ -3101,18 +2423,13 @@ module.exports = async function registerCommerceRoutes({
         };
       }
 
-      // ======================================
-      // GLOBAL STATS
-      // Independent of table filters
-      // ======================================
-
       const statsPipeline = [
-        { $match: onlineFilter },
-
+        {
+          $match: onlineFilter,
+        },
         {
           $group: {
             _id: null,
-
             total: { $sum: 1 },
 
             pending: {
@@ -3164,17 +2481,29 @@ module.exports = async function registerCommerceRoutes({
             },
 
             verifiedCollection: {
+              $sum: mongoOnlineReceived,
+            },
+
+            cashCollection: {
+              $sum: {
+                $ifNull: ["$payment.cashCollected", 0],
+              },
+            },
+
+            grossCollection: {
               $sum: {
                 $ifNull: ["$payment.verifiedAmount", 0],
+              },
+            },
+
+            refundedCollection: {
+              $sum: {
+                $ifNull: ["$payment.refundedAmount", 0],
               },
             },
           },
         },
       ];
-
-      // ======================================
-      // FETCH TABLE + TOTAL + STATS
-      // ======================================
 
       const [documents, total, statsResult] = await Promise.all([
         orders
@@ -3188,19 +2517,14 @@ module.exports = async function registerCommerceRoutes({
               status: 1,
               createdAt: 1,
               updatedAt: 1,
-
               uid: 1,
-
               "items.name": 1,
               "items.image": 1,
               "items.quantity": 1,
               "items.variantTitle": 1,
             },
           })
-          .sort({
-            createdAt: -1,
-            _id: -1,
-          })
+          .sort({ createdAt: -1, _id: -1 })
           .skip((page - 1) * limit)
           .limit(limit)
           .toArray(),
@@ -3217,11 +2541,10 @@ module.exports = async function registerCommerceRoutes({
         verified: 0,
         rejected: 0,
         verifiedCollection: 0,
+        cashCollection: 0,
+        grossCollection: 0,
+        refundedCollection: 0,
       };
-
-      // ========================================
-      // LOAD CUSTOMER PROFILE IMAGES
-      // ========================================
 
       const customerUids = [
         ...new Set(
@@ -3234,9 +2557,7 @@ module.exports = async function registerCommerceRoutes({
       const customerAccounts = customerUids.length
         ? await users
             .find(
-              {
-                uid: { $in: customerUids },
-              },
+              { uid: { $in: customerUids } },
               {
                 projection: {
                   uid: 1,
@@ -3253,7 +2574,6 @@ module.exports = async function registerCommerceRoutes({
       const customerPhotoMap = new Map(
         customerAccounts.map((account) => [
           account.uid,
-
           account.photoUrl ||
             account.photoURL ||
             account.imageUrl ||
@@ -3277,17 +2597,9 @@ module.exports = async function registerCommerceRoutes({
 
           return {
             ...order,
-
             _id: order._id.toString(),
-
-            // Registered Customer profile photo.
-            // Guest => no photo, icon fallback.
             customerPhotoUrl: customerPhotoMap.get(uid) || "",
-
-            // Total product quantity
             itemCount,
-
-            // Maximum two preview images
             items: items.slice(0, 2),
           };
         }),
@@ -3298,7 +2610,18 @@ module.exports = async function registerCommerceRoutes({
           partiallyPaid: stats.partiallyPaid,
           verified: stats.verified,
           rejected: stats.rejected,
-          verifiedCollection: stats.verifiedCollection,
+
+          verifiedCollection: currency(stats.verifiedCollection || 0),
+
+          cashCollection: currency(stats.cashCollection || 0),
+
+          grossCollection: currency(stats.grossCollection || 0),
+
+          refundedCollection: currency(stats.refundedCollection || 0),
+
+          netCollection: currency(
+            (stats.grossCollection || 0) - (stats.refundedCollection || 0),
+          ),
         },
 
         pagination: {
@@ -3311,10 +2634,6 @@ module.exports = async function registerCommerceRoutes({
     }),
   );
 
-  // =========================================
-  // GET /admin/orders/:identifier
-  // =========================================
-
   app.get(
     "/admin/orders/:identifier",
     verifyFirebaseToken,
@@ -3322,9 +2641,7 @@ module.exports = async function registerCommerceRoutes({
     handle(async (req, res) => {
       const order = await orders.findOne(orderFilter(req.params.identifier));
 
-      if (!order) {
-        fail("Order not found", 404);
-      }
+      if (!order) fail("Order not found", 404);
 
       let customerPhotoUrl = "";
 
@@ -3353,23 +2670,14 @@ module.exports = async function registerCommerceRoutes({
 
       return res.json({
         success: true,
-
         order: {
-          ...viewOrder(order),
-
+          ...viewAdminOrder(order),
           customerPhotoUrl,
-
-          // Only returned by admin endpoint.
           internalNotes: order.internalNotes || [],
         },
       });
     }),
   );
-
-  // ==========================================
-  // ADMIN INTERNAL NOTES
-  // POST /admin/orders/:identifier/notes
-  // ==========================================
 
   app.post(
     "/admin/orders/:identifier/notes",
@@ -3378,64 +2686,46 @@ module.exports = async function registerCommerceRoutes({
     handle(async (req, res) => {
       const text = str(req.body?.text, 1000);
 
-      if (!text) {
-        fail("Note cannot be empty");
-      }
+      if (!text) fail("Note cannot be empty");
 
-      const updated = await updateOrder(
-        req.params.identifier,
+      const updated = await updateOrder(req.params.identifier, (order) => {
+        const previous = Array.isArray(order.internalNotes)
+          ? order.internalNotes
+          : [];
 
-        (order) => {
-          const previous = Array.isArray(order.internalNotes)
-            ? order.internalNotes
-            : [];
+        const newNote = {
+          id: randomUUID(),
+          author: req.user.name || req.user.email || "SokhBilash Admin",
+          uid: req.user.uid,
+          text,
+          createdAt: new Date(),
+        };
 
-          const newNote = {
-            id: randomUUID(),
+        return {
+          set: {
+            internalNotes: [...previous.slice(-99), newNote],
+          },
 
-            author: req.user.name || req.user.email || "SokhBilash Admin",
-
-            uid: req.user.uid,
-
-            text,
-
-            createdAt: new Date(),
-          };
-
-          return {
-            set: {
-              internalNotes: [...previous.slice(-99), newNote],
-            },
-
-            event: "internal_note_added",
-
-            // Do not expose the note content
-            // through public order history.
-            note: "Admin-only note added",
-
-            by: req.user.uid,
-          };
-        },
-      );
+          event: "internal_note_added",
+          note: "Admin-only note added",
+          by: req.user.uid,
+        };
+      });
 
       res.set("Cache-Control", "no-store");
 
       return res.status(201).json({
         success: true,
         message: "Internal note saved",
-
         order: {
-          ...viewOrder(updated),
+          ...viewAdminOrder(updated),
           internalNotes: updated.internalNotes || [],
         },
       });
     }),
   );
 
-  // ==========================================
-  // ADMIN PAYMENT VERIFY / REJECT
-  // Secure cumulative reconciliation
-  // ==========================================
+  // Part 6 — Payment Verification, Phone Confirmation ও COD Collection
 
   app.patch(
     "/admin/orders/:identifier/payment",
@@ -3448,266 +2738,834 @@ module.exports = async function registerCommerceRoutes({
         fail("Invalid payment decision");
       }
 
-      const updated = await updateOrder(
-        req.params.identifier,
+      const updated = await updateOrder(req.params.identifier, (order) => {
+        const payment = order.payment || {};
 
-        (order) => {
-          const payment = order.payment || {};
+        if (payment.method === "cod") {
+          fail("Use phone confirmation for COD", 409);
+        }
 
-          if (payment.method === "cod") {
-            fail("Use phone confirmation for COD", 409);
+        if (order.status !== "pending" || payment.status !== "pending") {
+          fail("This payment proof is not pending review", 409);
+        }
+
+        const previous = currency(payment.verifiedAmount || 0);
+
+        const priorReviews = Array.isArray(payment.reviews)
+          ? payment.reviews
+          : [];
+
+        const now = new Date();
+
+        if (decision === "reject") {
+          const reason = str(req.body?.reason, 500);
+
+          if (!reason) {
+            fail("Rejection reason required");
           }
-
-          // Only a new pending proof can be
-          // verified or rejected.
-          // A partially reviewed proof cannot
-          // be credited twice.
-
-          if (order.status !== "pending" || payment.status !== "pending") {
-            fail(
-              "This payment proof is already reviewed or is not pending",
-              409,
-            );
-          }
-
-          const previous = currency(payment.verifiedAmount || 0);
-
-          // ==================================
-          // REJECT
-          // ==================================
-
-          if (decision === "reject") {
-            const reason = str(req.body?.reason, 500);
-
-            if (!reason) {
-              fail("Rejection reason required");
-            }
-
-            return {
-              set: {
-                status: "rejected",
-
-                payment: {
-                  ...payment,
-                  status: "rejected",
-                  rejectedReason: reason,
-                  verifiedBy: req.user.uid,
-                  verifiedAt: new Date(),
-
-                  // Previously verified money
-                  // must not disappear.
-                  verifiedAmount: previous,
-                  dueAmount: currency(order.total - previous),
-                },
-              },
-
-              event: "payment_rejected",
-              note: reason,
-              by: req.user.uid,
-            };
-          }
-
-          // ==================================
-          // VERIFY
-          // verifiedAmount is CUMULATIVE.
-          // ==================================
-
-          const amount = parseAmount(
-            req.body?.verifiedAmount,
-            "verified amount",
-          );
-
-          const receivedForThisProof = currency(amount - previous);
-
-          const claim = currency(payment.claimedAmount || 0);
-
-          const remaining = currency(order.total - previous);
-
-          if (receivedForThisProof <= 0) {
-            fail("Verified amount must increase", 409);
-          }
-
-          if (receivedForThisProof > claim) {
-            fail("Actual received amount exceeds submitted claim");
-          }
-
-          if (receivedForThisProof > remaining) {
-            fail("Received amount exceeds remaining due");
-          }
-
-          const due = currency(order.total - amount);
-
-          const fullyPaid = due <= 0;
 
           return {
             set: {
-              status: fullyPaid ? "verified" : "pending",
+              status: "rejected",
+              phoneConfirmed: false,
 
               payment: {
                 ...payment,
+                status: "rejected",
+                rejectedReason: reason,
+                verifiedAmount: previous,
 
-                status: fullyPaid ? "verified" : "partially_paid",
+                onlineVerifiedAmount: onlineReceived(payment),
 
-                verifiedAmount: amount,
-                dueAmount: due,
+                cancellationRefund:
+                  previous > 0
+                    ? newCancellationRefund(payment, reason, now)
+                    : null,
 
-                verifiedAt: new Date(),
+                dueAmount: Math.max(0, currency(order.total - previous)),
+
+                excessAmount: Math.max(0, currency(previous - order.total)),
+
                 verifiedBy: req.user.uid,
-                rejectedReason: null,
+                verifiedAt: now,
 
-                // Audit which proof was reviewed.
-                reviewedTrxId: payment.trxId,
+                reviews: [
+                  ...priorReviews,
+                  {
+                    decision: "reject",
+                    trxId: payment.trxId,
+                    claimedAmount: payment.claimedAmount,
+                    reason,
+                    by: req.user.uid,
+                    at: now,
+                  },
+                ],
               },
             },
 
-            event: fullyPaid
-              ? "payment_verified"
-              : "payment_partially_verified",
-
-            note:
-              `Received BDT ${receivedForThisProof}; ` +
-              `Cumulative BDT ${amount}; ` +
-              `Due BDT ${due}`,
-
+            event: "payment_rejected",
+            note: reason,
             by: req.user.uid,
           };
-        },
-      );
+        }
+
+        const verifiedAmount = parseAmount(
+          req.body?.verifiedAmount,
+          "verified amount",
+        );
+
+        const receivedNow = currency(verifiedAmount - previous);
+
+        const cashAlready = currency(payment.cashCollected || 0);
+
+        const newOnline = currency(verifiedAmount - cashAlready);
+
+        if (newOnline < onlineReceived(payment)) {
+          fail("Mobile receipts cannot decrease", 409);
+        }
+
+        if (receivedNow <= 0) {
+          fail(
+            "Verified amount must exceed the previously recorded amount",
+            409,
+          );
+        }
+
+        const dueAmount = Math.max(0, currency(order.total - verifiedAmount));
+
+        const excessAmount = Math.max(
+          0,
+          currency(verifiedAmount - order.total),
+        );
+
+        const status = dueAmount > 0 ? "partially_paid" : "verified";
+
+        const previousResolution = payment.excessResolution;
+
+        const resolution =
+          excessAmount > 0 && previousResolution?.amount === excessAmount
+            ? previousResolution
+            : null;
+
+        const ready =
+          order.phoneConfirmed === true &&
+          (excessAmount === 0 || Boolean(resolution?.type));
+
+        return {
+          set: {
+            status: ready ? "verified" : "pending",
+
+            payment: {
+              ...payment,
+              status,
+              verifiedAmount,
+              onlineVerifiedAmount: newOnline,
+              dueAmount,
+              excessAmount,
+              excessResolution: resolution,
+              verifiedAt: now,
+              verifiedBy: req.user.uid,
+              reviewedTrxId: payment.trxId,
+              rejectedReason: null,
+
+              reviews: [
+                ...priorReviews,
+                {
+                  decision: "verify",
+                  trxId: payment.trxId,
+                  claimedAmount: payment.claimedAmount,
+                  receivedForProof: receivedNow,
+                  cumulativeReceived: verifiedAmount,
+                  by: req.user.uid,
+                  at: now,
+                },
+              ],
+            },
+          },
+
+          event:
+            excessAmount > 0
+              ? "payment_overpaid_verified"
+              : dueAmount > 0
+                ? "payment_partially_verified"
+                : "payment_fully_verified",
+
+          note:
+            `Received BDT ${receivedNow}; ` +
+            `cumulative ${verifiedAmount}; ` +
+            `due ${dueAmount}; excess ${excessAmount}`,
+
+          by: req.user.uid,
+        };
+      });
 
       res.set("Cache-Control", "no-store");
 
       return res.json({
         success: true,
-        message: "Payment updated successfully",
-        order: viewOrder(updated),
+        message: "Payment reviewed successfully",
+        order: viewAdminOrder(updated),
       });
     }),
   );
-
-  // =========================================
-  // COD PHONE CONFIRMATION
-  // =========================================
 
   app.patch(
     "/admin/orders/:identifier/phone-confirmation",
     verifyFirebaseToken,
     verifyAdmin,
     handle(async (req, res) => {
-      if (typeof req.body.confirmed !== "boolean") {
+      if (typeof req.body?.confirmed !== "boolean") {
         fail("confirmed must be boolean");
       }
 
-      const updated = await updateOrder(
-        req.params.identifier,
+      const confirmed = req.body.confirmed;
+      const note = str(req.body?.note, 500);
 
-        (order) => {
-          if (order.payment.method !== "cod") {
-            fail("Not a COD order");
+      const resolutionType = str(req.body?.excessResolution, 30).toLowerCase();
+
+      if (
+        resolutionType &&
+        !["refund", "extra_product"].includes(resolutionType)
+      ) {
+        fail("Invalid excess resolution");
+      }
+
+      const updated = await updateOrder(req.params.identifier, (order) => {
+        if (!["pending", "verified"].includes(order.status)) {
+          fail("Phone confirmation cannot be changed at this order stage", 409);
+        }
+
+        const payment = order.payment || {};
+
+        const verified = currency(payment.verifiedAmount || 0);
+
+        const excessAmount = Math.max(0, currency(verified - order.total));
+
+        let excessResolution = payment.excessResolution || null;
+
+        if (confirmed && excessAmount > 0) {
+          if (!resolutionType && !excessResolution?.type) {
+            fail("Customer must agree to refund or extra_product", 409);
           }
 
-          if (!["pending", "verified"].includes(order.status)) {
-            fail("Cannot change phone confirmation", 409);
+          if (resolutionType) {
+            if (!note) {
+              fail("Customer agreement note required");
+            }
+
+            if (
+              excessResolution?.status === "completed" &&
+              excessResolution.type !== resolutionType
+            ) {
+              fail("Completed resolution cannot be changed", 409);
+            }
+
+            const same =
+              excessResolution?.type === resolutionType &&
+              excessResolution?.amount === excessAmount;
+
+            excessResolution = same
+              ? excessResolution
+              : {
+                  type: resolutionType,
+                  amount: excessAmount,
+                  status: "pending",
+                  note,
+                  agreedAt: new Date(),
+                  agreedBy: req.user.uid,
+                  completedAt: null,
+                };
           }
+        }
 
-          return {
-            set: {
-              phoneConfirmed: req.body.confirmed,
+        const paymentReviewed =
+          payment.method === "cod" ||
+          ["verified", "partially_paid", "cod_collected"].includes(
+            payment.status,
+          );
 
-              status: req.body.confirmed ? "verified" : "pending",
+        const resolutionReady =
+          excessAmount === 0 || Boolean(excessResolution?.type);
+
+        const approve = confirmed && paymentReviewed && resolutionReady;
+
+        return {
+          set: {
+            phoneConfirmed: confirmed,
+
+            phoneConfirmation: {
+              confirmed,
+              note,
+              confirmedAt: confirmed ? new Date() : null,
+              confirmedBy: confirmed ? req.user.uid : null,
             },
 
-            event: req.body.confirmed ? "phone_confirmed" : "phone_unconfirmed",
+            payment: {
+              ...payment,
+              excessResolution,
+            },
 
-            note: req.body.confirmed
-              ? "COD confirmed by phone"
-              : "Confirmation revoked",
+            status: approve ? "verified" : "pending",
+          },
 
-            by: req.user.uid,
-          };
-        },
-      );
+          event: confirmed ? "phone_confirmed" : "phone_unconfirmed",
 
-      res.json({
+          note:
+            note ||
+            (confirmed
+              ? "Customer confirmed by phone"
+              : "Confirmation revoked"),
+
+          by: req.user.uid,
+        };
+      });
+
+      res.set("Cache-Control", "no-store");
+
+      return res.json({
         success: true,
-
-        order: viewOrder(updated),
+        order: viewAdminOrder(updated),
       });
     }),
   );
 
-  // =========================================
-  // ADMIN ORDER STATUS
-  // =========================================
+  app.patch(
+    "/admin/orders/:identifier/collect-balance",
+    verifyFirebaseToken,
+    verifyAdmin,
+    handle(async (req, res) => {
+      const collectionId = checkoutIdOf(req.body?.collectionId);
+
+      const collectedAmount = parseAmount(req.body?.amount, "collected amount");
+
+      const note = str(req.body?.note, 500);
+
+      if (!note) {
+        fail("Collection note is required");
+      }
+
+      const updated = await updateOrder(req.params.identifier, (order) => {
+        const payment = order.payment || {};
+
+        const existing = Array.isArray(payment.deliveryCollections)
+          ? payment.deliveryCollections
+          : [];
+
+        const sameId = existing.find(
+          (entry) => entry.collectionId === collectionId,
+        );
+
+        if (sameId) {
+          if (currency(sameId.amount) !== currency(collectedAmount)) {
+            fail("Collection ID has already been used for another amount", 409);
+          }
+
+          return { noop: true };
+        }
+
+        if (
+          !["verified", "processing", "shipped", "delivered"].includes(
+            order.status,
+          )
+        ) {
+          fail("Order is not ready for balance collection", 409);
+        }
+
+        if (order.phoneConfirmed !== true) {
+          fail("Phone confirmation required", 409);
+        }
+
+        const previousReceived = currency(payment.verifiedAmount || 0);
+
+        const currentDue = Math.max(
+          0,
+          currency(order.total - previousReceived),
+        );
+
+        if (currentDue <= 0) {
+          fail("No outstanding balance", 409);
+        }
+
+        if (currency(collectedAmount) > currentDue) {
+          fail("Collection amount exceeds outstanding balance", 409);
+        }
+
+        const newReceived = currency(previousReceived + collectedAmount);
+
+        const newDue = Math.max(0, currency(order.total - newReceived));
+
+        const cashCollected = currency(
+          (payment.cashCollected || 0) + collectedAmount,
+        );
+
+        const paymentStatus =
+          payment.method === "cod"
+            ? newDue === 0
+              ? "cod_collected"
+              : "cod_pending"
+            : newDue === 0
+              ? "verified"
+              : "partially_paid";
+
+        return {
+          set: {
+            payment: {
+              ...payment,
+              status: paymentStatus,
+              verifiedAmount: newReceived,
+
+              onlineVerifiedAmount: onlineReceived(payment),
+
+              dueAmount: newDue,
+
+              excessAmount: Math.max(0, currency(newReceived - order.total)),
+
+              cashCollected,
+
+              deliveryCollections: [
+                ...existing,
+                {
+                  collectionId,
+                  amount: collectedAmount,
+                  method: "cash_on_delivery",
+                  note,
+                  collectedAt: new Date(),
+                  collectedBy: req.user.uid,
+                },
+              ],
+            },
+          },
+
+          event: "delivery_balance_collected",
+
+          note:
+            `Cash BDT ${collectedAmount}; ` +
+            `remaining BDT ${newDue}. ${note}`,
+
+          by: req.user.uid,
+        };
+      });
+
+      res.set("Cache-Control", "no-store");
+
+      return res.json({
+        success: true,
+        message: "Delivery collection recorded",
+        order: viewAdminOrder(updated),
+      });
+    }),
+  );
+
+  // Part 7 — Excess Refund, Cancelled Order Refund ও Tracking
+
+  app.patch(
+    "/admin/orders/:identifier/excess-resolution",
+    verifyFirebaseToken,
+    verifyAdmin,
+    handle(async (req, res) => {
+      if (req.body?.completed !== true) {
+        fail("Set completed: true after actual fulfillment");
+      }
+
+      const note = str(req.body?.note, 500);
+      if (!note) fail("Completion note required");
+
+      const reference = str(req.body?.reference, 150);
+
+      const updated = await updateOrder(req.params.identifier, (order) => {
+        if (["cancelled", "rejected"].includes(order.status)) {
+          fail("Cannot settle a cancelled or rejected order", 409);
+        }
+
+        if (order.phoneConfirmed !== true) {
+          fail("Phone confirmation required", 409);
+        }
+
+        const payment = order.payment || {};
+        const resolution = payment.excessResolution;
+
+        if (
+          !resolution ||
+          !["refund", "extra_product"].includes(resolution.type)
+        ) {
+          fail("No agreed excess resolution", 409);
+        }
+
+        if (resolution.status === "completed") {
+          return { noop: true };
+        }
+
+        const excess = Math.max(
+          0,
+          currency((payment.verifiedAmount || 0) - order.total),
+        );
+
+        if (excess <= 0 || currency(resolution.amount) !== excess) {
+          fail("Excess amount has changed; review again", 409);
+        }
+
+        let extraProducts = [];
+
+        if (resolution.type === "refund") {
+          if (!reference) {
+            fail("Refund transaction/receipt reference is required");
+          }
+        } else {
+          if (
+            !Array.isArray(req.body?.extraProducts) ||
+            !req.body.extraProducts.length ||
+            req.body.extraProducts.length > 20
+          ) {
+            fail("List the delivered extra products (maximum 20)");
+          }
+
+          extraProducts = req.body.extraProducts.map((item) => {
+            const name = str(item?.name, 200);
+            const sku = str(item?.sku, 100);
+            const quantity = Number(item?.quantity);
+
+            const unitPrice = parseAmount(
+              item?.unitPrice,
+              "extra product unit price",
+            );
+
+            if (
+              !name ||
+              !Number.isInteger(quantity) ||
+              quantity < 1 ||
+              quantity > 100
+            ) {
+              fail("Invalid extra product name or quantity");
+            }
+
+            return {
+              name,
+              sku,
+              quantity,
+              unitPrice,
+            };
+          });
+
+          const equivalent = currency(
+            extraProducts.reduce(
+              (sum, item) => sum + item.quantity * item.unitPrice,
+              0,
+            ),
+          );
+
+          if (equivalent !== excess) {
+            fail(
+              `Extra product value BDT ${equivalent} does not equal excess BDT ${excess}`,
+            );
+          }
+        }
+
+        return {
+          set: {
+            payment: {
+              ...payment,
+
+              refundedAmount:
+                resolution.type === "refund"
+                  ? currency((payment.refundedAmount || 0) + excess)
+                  : currency(payment.refundedAmount || 0),
+
+              refunds:
+                resolution.type === "refund"
+                  ? [
+                      ...(payment.refunds || []),
+                      {
+                        refundId: randomUUID(),
+                        type: "overpayment",
+                        amount: excess,
+                        reference,
+                        method: payment.method,
+                        note,
+                        refundedAt: new Date(),
+                        by: req.user.uid,
+                      },
+                    ]
+                  : payment.refunds || [],
+
+              excessResolution: {
+                ...resolution,
+                status: "completed",
+                completedAt: new Date(),
+                completedBy: req.user.uid,
+                completionNote: note,
+                reference: reference || null,
+                extraProducts,
+              },
+            },
+          },
+
+          event:
+            resolution.type === "refund"
+              ? "excess_refund_completed"
+              : "extra_product_completed",
+
+          note: `Excess BDT ${excess}; ` + `${resolution.type}; ${note}`,
+
+          by: req.user.uid,
+        };
+      });
+
+      res.set("Cache-Control", "no-store");
+
+      return res.json({
+        success: true,
+        message: "Excess resolution recorded",
+        order: viewAdminOrder(updated),
+      });
+    }),
+  );
+
+  // Cancelled/rejected order funds must be returned.
+  // Any previously completed refund is deducted.
+
+  app.patch(
+    "/admin/orders/:identifier/refund",
+    verifyFirebaseToken,
+    verifyAdmin,
+    handle(async (req, res) => {
+      if (req.body?.completed !== true) {
+        fail("completed: true required after funds are actually returned");
+      }
+
+      const refundId = checkoutIdOf(req.body?.refundId);
+
+      const amount = parseAmount(req.body?.amount, "refund amount");
+
+      const reference = str(req.body?.reference, 150);
+
+      const note = str(req.body?.note, 500);
+
+      const method = str(req.body?.method, 20).toLowerCase();
+
+      if (!reference || !note) {
+        fail("Refund reference and note required");
+      }
+
+      if (
+        !["bkash", "nagad", "rocket", "bank", "cash", "other"].includes(method)
+      ) {
+        fail("Invalid refund method");
+      }
+
+      const updated = await updateOrder(req.params.identifier, (order) => {
+        if (!["cancelled", "rejected"].includes(order.status)) {
+          fail("This endpoint is only for cancelled/rejected orders", 409);
+        }
+
+        const p = order.payment || {};
+
+        const prior = Array.isArray(p.refunds) ? p.refunds : [];
+
+        const existing = prior.find((entry) => entry.refundId === refundId);
+
+        if (existing) {
+          if (
+            currency(existing.amount) !== amount ||
+            existing.reference !== reference
+          ) {
+            fail("Refund ID reused with different details", 409);
+          }
+
+          return { noop: true };
+        }
+
+        const pending = refundableBalance(p);
+
+        if (pending <= 0) {
+          fail("No remaining money to refund", 409);
+        }
+
+        if (amount > pending) {
+          fail(`Refund exceeds outstanding BDT ${pending}`, 409);
+        }
+
+        const refundedAmount = currency((p.refundedAmount || 0) + amount);
+
+        const remainingAmount = Math.max(0, currency(pending - amount));
+
+        const previousCase =
+          p.cancellationRefund ||
+          newCancellationRefund(p, "Rejected order", new Date());
+
+        const now = new Date();
+
+        return {
+          set: {
+            payment: {
+              ...p,
+              refundedAmount,
+
+              refunds: [
+                ...prior,
+                {
+                  refundId,
+                  type: "cancellation",
+                  amount,
+                  method,
+                  reference,
+                  note,
+                  refundedAt: now,
+                  by: req.user.uid,
+                },
+              ],
+
+              cancellationRefund: {
+                ...previousCase,
+
+                status:
+                  remainingAmount === 0 ? "completed" : "partially_refunded",
+
+                remainingAmount,
+
+                completedAt: remainingAmount === 0 ? now : null,
+              },
+            },
+          },
+
+          event:
+            remainingAmount === 0
+              ? "cancellation_refund_completed"
+              : "cancellation_refund_partial",
+
+          note:
+            `Refund BDT ${amount} via ${method}; ` +
+            `remaining ${remainingAmount}; ${note}`,
+
+          by: req.user.uid,
+        };
+      });
+
+      res.set("Cache-Control", "no-store");
+
+      res.json({
+        success: true,
+        message: "Refund recorded",
+        order: viewAdminOrder(updated),
+      });
+    }),
+  );
 
   app.patch(
     "/admin/orders/:identifier/status",
     verifyFirebaseToken,
     verifyAdmin,
     handle(async (req, res) => {
-      const status = str(req.body.status, 30);
+      const status = str(req.body?.status, 30);
 
-      const note = str(req.body.note, 500);
+      const note = str(req.body?.note, 500);
 
       const transitions = {
         pending: ["verified", "cancelled"],
-
         verified: ["processing", "cancelled"],
-
         processing: ["shipped", "cancelled"],
-
         shipped: ["delivered"],
-
         delivered: [],
         rejected: [],
         cancelled: [],
       };
 
-      const updated = await updateOrder(
-        req.params.identifier,
+      const updated = await updateOrder(req.params.identifier, (order) => {
+        if (!transitions[order.status]?.includes(status)) {
+          fail("Invalid order status transition", 409);
+        }
 
-        (order) => {
-          if (!transitions[order.status]?.includes(status)) {
-            fail("Invalid status transition", 409);
+        const payment = order.payment || {};
+
+        const verifiedAmount = currency(payment.verifiedAmount || 0);
+
+        const due = Math.max(0, currency(order.total - verifiedAmount));
+
+        const excess = Math.max(0, currency(verifiedAmount - order.total));
+
+        if (
+          ["verified", "processing", "shipped", "delivered"].includes(status)
+        ) {
+          if (order.phoneConfirmed !== true) {
+            fail("Phone confirmation required", 409);
           }
 
-          if (status === "verified" || status === "processing") {
-            const allowed =
-              order.payment.method === "cod"
-                ? order.phoneConfirmed === true
-                : order.payment.status === "verified";
-
-            if (!allowed) {
-              fail("Payment or phone verification required", 409);
-            }
+          if (
+            payment.method !== "cod" &&
+            !["verified", "partially_paid"].includes(payment.status)
+          ) {
+            fail("Admin payment verification required", 409);
           }
 
-          return {
-            set: {
-              status,
-            },
+          if (excess > 0 && !payment.excessResolution?.type) {
+            fail("Customer overpayment agreement required", 409);
+          }
+        }
 
-            event: status,
+        if (status === "delivered") {
+          if (due > 0) {
+            fail(
+              `Outstanding BDT ${due}; collect balance before delivery`,
+              409,
+            );
+          }
 
-            note: note || `Order marked ${status}`,
+          if (excess > 0 && payment.excessResolution?.status !== "completed") {
+            fail("Refund/extra product must be completed before delivery", 409);
+          }
+        }
 
-            by: req.user.uid,
+        const set = { status };
+
+        if (status === "cancelled") {
+          const oldResolution = payment.excessResolution;
+
+          if (
+            oldResolution?.type === "extra_product" &&
+            oldResolution.status === "completed"
+          ) {
+            fail(
+              "Extra product already fulfilled; resolve its return before cancellation",
+              409,
+            );
+          }
+
+          const cancellationRefund = newCancellationRefund(
+            payment,
+            note || "Order cancelled",
+            new Date(),
+          );
+
+          set.payment = {
+            ...payment,
+            cancellationRefund,
+
+            excessResolution:
+              oldResolution && oldResolution.status !== "completed"
+                ? {
+                    ...oldResolution,
+                    status: "superseded_by_cancellation",
+                  }
+                : oldResolution || null,
           };
-        },
-      );
+        }
 
-      res.json({
+        return {
+          set,
+          event: status,
+          note: note || `Order marked ${status}`,
+          by: req.user.uid,
+        };
+      });
+
+      res.set("Cache-Control", "no-store");
+
+      return res.json({
         success: true,
-
         message: "Order status updated",
-
-        order: viewOrder(updated),
+        order: viewAdminOrder(updated),
       });
     }),
   );
-
-  // =========================================
-  // ADMIN COURIER/TRACKING
-  // =========================================
 
   app.patch(
     "/admin/orders/:identifier/tracking",
@@ -3721,10 +3579,6 @@ module.exports = async function registerCommerceRoutes({
       const trackingUrl = str(req.body?.trackingUrl, 2048);
 
       const parcelWeight = str(req.body?.parcelWeight, 30);
-
-      // ====================================
-      // VALIDATION
-      // ====================================
 
       if (!name && (trackingNumber || trackingUrl || parcelWeight)) {
         fail(
@@ -3746,10 +3600,6 @@ module.exports = async function registerCommerceRoutes({
       ) {
         fail("Invalid parcel weight. Example: 1.5 kg or 500 g");
       }
-
-      // Keep compatibility with the existing
-      // Order Management tracking form.
-      // If date is not supplied, do not touch it.
 
       const dateProvided = Object.prototype.hasOwnProperty.call(
         req.body || {},
@@ -3773,74 +3623,52 @@ module.exports = async function registerCommerceRoutes({
         }
       }
 
-      // ====================================
-      // ATOMIC ORDER UPDATE
-      // ====================================
+      const updated = await updateOrder(req.params.identifier, (order) => {
+        if (["rejected", "cancelled"].includes(order.status)) {
+          fail("Cannot edit an inactive order", 409);
+        }
 
-      const updated = await updateOrder(
-        req.params.identifier,
-
-        (order) => {
-          if (["rejected", "cancelled"].includes(order.status)) {
-            fail("Cannot edit an inactive order", 409);
-          }
-
-          return {
-            set: {
-              courier: {
-                ...order.courier,
-
-                name: name || null,
-
-                trackingNumber: trackingNumber || null,
-
-                trackingUrl: trackingUrl || null,
-
-                parcelWeight: parcelWeight || null,
-              },
-
-              // Only change the date when the
-              // client explicitly supplies it.
-              ...(dateProvided ? { estimatedDelivery } : {}),
+        return {
+          set: {
+            courier: {
+              ...order.courier,
+              name: name || null,
+              trackingNumber: trackingNumber || null,
+              trackingUrl: trackingUrl || null,
+              parcelWeight: parcelWeight || null,
             },
 
-            event: "tracking_updated",
+            ...(dateProvided ? { estimatedDelivery } : {}),
+          },
 
-            note:
-              `Courier: ${name || "Unassigned"}; ` +
-              `Tracking: ${trackingNumber || "None"}; ` +
-              `Weight: ${parcelWeight || "None"}`,
+          event: "tracking_updated",
 
-            by: req.user.uid,
-          };
-        },
-      );
+          note:
+            `Courier: ${name || "Unassigned"}; ` +
+            `Tracking: ${trackingNumber || "None"}; ` +
+            `Weight: ${parcelWeight || "None"}`,
+
+          by: req.user.uid,
+        };
+      });
 
       res.set("Cache-Control", "no-store");
 
       return res.json({
         success: true,
         message: "Courier details updated",
-
-        order: viewOrder(updated),
+        order: viewAdminOrder(updated),
       });
     }),
   );
 
-  // ================================================
-  // ADMIN DASHBOARD - FULL DYNAMIC API
-  // GET /admin/dashboard
-  // ================================================
+  // Part 8 — Admin Dashboard
 
   app.get(
     "/admin/dashboard",
     verifyFirebaseToken,
     verifyAdmin,
     handle(async (req, res) => {
-      // ==========================================
-      // DHAKA TIMEZONE
-      // ==========================================
-
       const now = new Date();
       const DAY_MS = 24 * 60 * 60 * 1000;
       const DHAKA_OFFSET_MS = 6 * 60 * 60 * 1000;
@@ -3850,7 +3678,6 @@ module.exports = async function registerCommerceRoutes({
       const year = dhakaNow.getUTCFullYear();
       const month = dhakaNow.getUTCMonth();
       const day = dhakaNow.getUTCDate();
-
       const todayCalendar = Date.UTC(year, month, day);
 
       const todayStart = new Date(todayCalendar - DHAKA_OFFSET_MS);
@@ -3880,10 +3707,6 @@ module.exports = async function registerCommerceRoutes({
         return Math.round(((current - previous) / previous) * 1000) / 10;
       };
 
-      // ==========================================
-      // BUSINESS CONFIGURATION
-      // ==========================================
-
       const activeStatuses = ["pending", "verified", "processing", "shipped"];
 
       const onlineMethods = ["bkash", "nagad", "rocket"];
@@ -3896,7 +3719,9 @@ module.exports = async function registerCommerceRoutes({
                 input: {
                   $ifNull: ["$items", []],
                 },
+
                 as: "item",
+
                 cond: {
                   $in: ["$$item.customization.mode", ["frame", "note"]],
                 },
@@ -3907,28 +3732,24 @@ module.exports = async function registerCommerceRoutes({
         ],
       };
 
-      // ==========================================
-      // 1. DASHBOARD KPI AGGREGATION
-      // ==========================================
-
       const overviewPipeline = [
         {
           $group: {
             _id: null,
+            totalOrders: { $sum: 1 },
 
-            // All orders
-            totalOrders: {
-              $sum: 1,
-            },
-
-            // Pending orders
             pendingOrders: {
               $sum: {
-                $cond: [{ $eq: ["$status", "pending"] }, 1, 0],
+                $cond: [
+                  {
+                    $eq: ["$status", "pending"],
+                  },
+                  1,
+                  0,
+                ],
               },
             },
 
-            // Only unreviewed online payment proofs
             pendingPayments: {
               $sum: {
                 $cond: [
@@ -3951,18 +3772,24 @@ module.exports = async function registerCommerceRoutes({
               },
             },
 
-            // Delivered orders
             deliveredOrders: {
               $sum: {
-                $cond: [{ $eq: ["$status", "delivered"] }, 1, 0],
+                $cond: [
+                  {
+                    $eq: ["$status", "delivered"],
+                  },
+                  1,
+                  0,
+                ],
               },
             },
 
-            // Total fulfilled sales
             totalSales: {
               $sum: {
                 $cond: [
-                  { $eq: ["$status", "delivered"] },
+                  {
+                    $eq: ["$status", "delivered"],
+                  },
                   {
                     $ifNull: ["$total", 0],
                   },
@@ -3971,7 +3798,54 @@ module.exports = async function registerCommerceRoutes({
               },
             },
 
-            // Outstanding balance on active orders
+            onlineCollection: {
+              $sum: mongoOnlineReceived,
+            },
+
+            cashCollection: {
+              $sum: {
+                $ifNull: ["$payment.cashCollected", 0],
+              },
+            },
+
+            grossCollection: {
+              $sum: {
+                $ifNull: ["$payment.verifiedAmount", 0],
+              },
+            },
+
+            refundedCollection: {
+              $sum: {
+                $ifNull: ["$payment.refundedAmount", 0],
+              },
+            },
+
+            refundsPending: {
+              $sum: {
+                $cond: [
+                  {
+                    $in: ["$status", ["cancelled", "rejected"]],
+                  },
+                  {
+                    $max: [
+                      0,
+                      {
+                        $subtract: [
+                          {
+                            $ifNull: ["$payment.verifiedAmount", 0],
+                          },
+                          {
+                            $ifNull: ["$payment.refundedAmount", 0],
+                          },
+                        ],
+                      },
+                    ],
+                  },
+                  0,
+                ],
+              },
+            },
+
             outstandingBalance: {
               $sum: {
                 $cond: [
@@ -3998,7 +3872,6 @@ module.exports = async function registerCommerceRoutes({
               },
             },
 
-            // COD phone confirmation pending
             codUnconfirmed: {
               $sum: {
                 $cond: [
@@ -4021,7 +3894,6 @@ module.exports = async function registerCommerceRoutes({
               },
             },
 
-            // Custom orders in production
             customProcessing: {
               $sum: {
                 $cond: [
@@ -4042,10 +3914,6 @@ module.exports = async function registerCommerceRoutes({
         },
       ];
 
-      // ==========================================
-      // 2. CURRENT MONTH ORDER STATUS CHART
-      // ==========================================
-
       const monthStatusPipeline = [
         {
           $match: {
@@ -4058,17 +3926,10 @@ module.exports = async function registerCommerceRoutes({
         {
           $group: {
             _id: "$status",
-            count: {
-              $sum: 1,
-            },
+            count: { $sum: 1 },
           },
         },
       ];
-
-      // ==========================================
-      // 3. SALES TREND
-      // Delivered orders grouped by createdAt
-      // ==========================================
 
       const salesPipeline = [
         {
@@ -4097,15 +3958,9 @@ module.exports = async function registerCommerceRoutes({
           },
         },
         {
-          $sort: {
-            _id: 1,
-          },
+          $sort: { _id: 1 },
         },
       ];
-
-      // ==========================================
-      // 4. VERIFIED ONLINE PAYMENT COLLECTION
-      // ==========================================
 
       const paymentPipeline = [
         {
@@ -4119,17 +3974,11 @@ module.exports = async function registerCommerceRoutes({
           $group: {
             _id: "$payment.method",
             amount: {
-              $sum: {
-                $ifNull: ["$payment.verifiedAmount", 0],
-              },
+              $sum: mongoOnlineReceived,
             },
           },
         },
       ];
-
-      // ==========================================
-      // 5. FETCH DASHBOARD DATA
-      // ==========================================
 
       const [
         overviewRows,
@@ -4150,11 +3999,6 @@ module.exports = async function registerCommerceRoutes({
 
         orders.aggregate(paymentPipeline).toArray(),
 
-        // ======================================
-        // RECENT 5 ORDERS
-        // Order Management-style table
-        // ======================================
-
         orders
           .find(
             {},
@@ -4164,30 +4008,23 @@ module.exports = async function registerCommerceRoutes({
                 uid: 1,
                 guest: 1,
                 orderNumber: 1,
-
                 "customer.name": 1,
                 "customer.phone": 1,
-
                 "shipping.phone": 1,
-
                 "items.name": 1,
                 "items.image": 1,
                 "items.quantity": 1,
                 "items.variantTitle": 1,
                 "items.cartId": 1,
                 "items.productId": 1,
-
                 total: 1,
                 status: 1,
-
                 "payment.method": 1,
                 "payment.status": 1,
                 "payment.verifiedAmount": 1,
                 "payment.dueAmount": 1,
-
                 "courier.name": 1,
                 "courier.trackingNumber": 1,
-
                 createdAt: 1,
               },
             },
@@ -4199,7 +4036,6 @@ module.exports = async function registerCommerceRoutes({
           .limit(5)
           .toArray(),
 
-        // First COD order requiring a call
         orders.findOne(
           {
             status: "pending",
@@ -4218,7 +4054,6 @@ module.exports = async function registerCommerceRoutes({
           },
         ),
 
-        // First customized order in progress
         orders.findOne(
           {
             status: {
@@ -4238,7 +4073,6 @@ module.exports = async function registerCommerceRoutes({
           },
         ),
 
-        // Orders in current 30 days
         orders.countDocuments({
           createdAt: {
             $gte: current30Start,
@@ -4246,7 +4080,6 @@ module.exports = async function registerCommerceRoutes({
           },
         }),
 
-        // Orders in previous 30 days
         orders.countDocuments({
           createdAt: {
             $gte: previous30Start,
@@ -4254,10 +4087,6 @@ module.exports = async function registerCommerceRoutes({
           },
         }),
       ]);
-
-      // ==========================================
-      // 6. CUSTOMER PROFILE PHOTOS
-      // ==========================================
 
       const recentUids = [
         ...new Set(
@@ -4299,10 +4128,6 @@ module.exports = async function registerCommerceRoutes({
         ]),
       );
 
-      // ==========================================
-      // 7. KPI RESULT
-      // ==========================================
-
       const overview = overviewRows[0] || {};
 
       const totalOrders = Number(overview.totalOrders) || 0;
@@ -4322,19 +4147,11 @@ module.exports = async function registerCommerceRoutes({
         previous30Orders,
       );
 
-      // ==========================================
-      // 8. DAILY SALES LOOKUP
-      // ==========================================
-
       const dailySalesMap = new Map(
         salesRows.map((row) => [row._id, roundMoney(row.sales)]),
       );
 
       const saleOn = (date) => dailySalesMap.get(date) || 0;
-
-      // ==========================================
-      // 9. DAILY SALES - LAST 7 DAYS
-      // ==========================================
 
       const weekdayFormatter = new Intl.DateTimeFormat("bn-BD", {
         weekday: "short",
@@ -4349,10 +4166,6 @@ module.exports = async function registerCommerceRoutes({
           sales: saleOn(dateKey(date)),
         };
       });
-
-      // ==========================================
-      // 10. WEEKLY SALES - LAST 4 WEEKS
-      // ==========================================
 
       const weekLabels = ["১ম", "২য়", "৩য়", "৪র্থ"];
 
@@ -4372,10 +4185,6 @@ module.exports = async function registerCommerceRoutes({
           sales: roundMoney(sales),
         };
       });
-
-      // ==========================================
-      // 11. MONTHLY SALES - LAST 6 MONTHS
-      // ==========================================
 
       const monthlyFormatter = new Intl.DateTimeFormat("bn-BD", {
         month: "short",
@@ -4403,10 +4212,6 @@ module.exports = async function registerCommerceRoutes({
         });
       }
 
-      // ==========================================
-      // 12. SALES GROWTH - LAST 30 DAYS
-      // ==========================================
-
       const current30Key = dateKey(new Date(todayCalendar - 29 * DAY_MS));
 
       const previous30Key = dateKey(new Date(todayCalendar - 59 * DAY_MS));
@@ -4426,10 +4231,6 @@ module.exports = async function registerCommerceRoutes({
         roundMoney(current30Sales),
         roundMoney(previous30Sales),
       );
-
-      // ==========================================
-      // 13. ORDER STATUS DISTRIBUTION
-      // ==========================================
 
       const monthlyStatusCounts = Object.fromEntries(
         monthStatusRows.map((item) => [item._id, item.count]),
@@ -4473,10 +4274,6 @@ module.exports = async function registerCommerceRoutes({
 
       const statusTotal = statusData.reduce((sum, item) => sum + item.value, 0);
 
-      // ==========================================
-      // 14. VERIFIED PAYMENT BY METHOD
-      // ==========================================
-
       const paymentMap = new Map(
         paymentRows.map((item) => [item._id, roundMoney(item.amount)]),
       );
@@ -4499,11 +4296,6 @@ module.exports = async function registerCommerceRoutes({
         },
       ];
 
-      // ==========================================
-      // 15. RECENT ORDERS
-      // Order Management compatible format
-      // ==========================================
-
       const recentOrders = recentDocuments.map((order) => {
         const items = Array.isArray(order.items) ? order.items : [];
 
@@ -4524,21 +4316,14 @@ module.exports = async function registerCommerceRoutes({
 
         return {
           _id: order._id.toString(),
-
           orderNumber: order.orderNumber || "—",
-
           createdAt: order.createdAt || null,
-
           status: order.status || "pending",
-
           total: roundMoney(order.total),
-
           guest: Boolean(order.guest),
 
-          // Customer information
           customer: {
             name: order.customer?.name || "Unknown Customer",
-
             phone: order.customer?.phone || "",
           },
 
@@ -4546,51 +4331,32 @@ module.exports = async function registerCommerceRoutes({
             phone: order.shipping?.phone || "",
           },
 
-          // Registered customer avatar
           customerPhotoUrl: order.guest
             ? ""
             : customerPhotoMap.get(order.uid) || "",
 
-          // Total quantity
           itemCount,
-
-          // Maximum two product previews
           items: items.slice(0, 2),
 
-          // Financial details
           payment: {
             method: order.payment?.method || null,
-
             status: order.payment?.status || null,
-
             verifiedAmount,
-
             dueAmount,
           },
 
-          // Courier information
           courier: {
             name: order.courier?.name || null,
-
             trackingNumber: order.courier?.trackingNumber || null,
           },
         };
       });
 
-      // ==========================================
-      // 16. FINAL DASHBOARD RESPONSE
-      // ==========================================
-
       res.set("Cache-Control", "private, no-store");
 
       return res.status(200).json({
         success: true,
-
         generatedAt: now.toISOString(),
-
-        // ======================================
-        // SIX KPI CARDS
-        // ======================================
 
         kpis: {
           totalOrders,
@@ -4600,21 +4366,28 @@ module.exports = async function registerCommerceRoutes({
           pendingPayments: Number(overview.pendingPayments) || 0,
 
           totalSales,
-
           deliveredOrders,
-
           outstandingBalance,
 
+          onlineCollection: roundMoney(overview.onlineCollection),
+
+          cashCollection: roundMoney(overview.cashCollection),
+
+          grossCollection: roundMoney(overview.grossCollection),
+
+          refundedCollection: roundMoney(overview.refundedCollection),
+
+          netCollection: roundMoney(
+            (overview.grossCollection || 0) -
+              (overview.refundedCollection || 0),
+          ),
+
+          refundsPending: roundMoney(overview.refundsPending),
+
           deliveryRate,
-
           orderGrowthPercent,
-
           salesGrowthPercent,
         },
-
-        // ======================================
-        // NEEDS ATTENTION CARDS
-        // ======================================
 
         attention: {
           paymentPending: Number(overview.pendingPayments) || 0,
@@ -4628,56 +4401,27 @@ module.exports = async function registerCommerceRoutes({
           firstCustomOrderId: firstCustomOrder?._id?.toString() || null,
         },
 
-        // ======================================
-        // SALES TREND
-        // ======================================
-
         salesData: {
           daily,
           weekly,
           monthly,
         },
 
-        // ======================================
-        // ORDER STATUS CHART
-        // ======================================
-
         statusData,
         statusTotal,
-
-        // ======================================
-        // PAYMENT METHOD CHART
-        // ======================================
-
         paymentData,
-
-        // ======================================
-        // RECENT ORDERS TABLE
-        // ======================================
-
         recentOrders,
       });
     }),
   );
 
-  // ===================================================
-  // ADMIN CUSTOMER MANAGEMENT - READ ONLY
-  // GET /admin/customers
-  //
-  // Existing dependencies:
-  // app, users, orders, verifyFirebaseToken,
-  // verifyAdmin, handle, str, fail
-  // ===================================================
+  // Part 9 — Admin Customer Management
 
   app.get(
     "/admin/customers",
     verifyFirebaseToken,
     verifyAdmin,
     handle(async (req, res) => {
-      // ==========================================
-      // PAGINATION
-      // ==========================================
-
       const pageRaw = str(req.query.page ?? "1", 6);
 
       if (!/^[1-9]\d{0,5}$/.test(pageRaw)) {
@@ -4688,11 +4432,6 @@ module.exports = async function registerCommerceRoutes({
 
       const perPage = 10;
       const skip = (page - 1) * perPage;
-
-      // ==========================================
-      // FILTERS
-      // ==========================================
-
       const search = str(req.query.search, 80);
 
       const status = str(req.query.status || "all", 20).toLowerCase();
@@ -4708,10 +4447,6 @@ module.exports = async function registerCommerceRoutes({
       if (!["all", "with_orders", "no_orders"].includes(ordersFilter)) {
         fail("Invalid customer order filter");
       }
-
-      // ==========================================
-      // SORT OPTIONS
-      // ==========================================
 
       const sorts = {
         newest: {
@@ -4747,10 +4482,6 @@ module.exports = async function registerCommerceRoutes({
         fail("Invalid sort option");
       }
 
-      // ==========================================
-      // CUSTOMER BASE FILTER
-      // ==========================================
-
       const match = {
         role: "customer",
       };
@@ -4763,25 +4494,15 @@ module.exports = async function registerCommerceRoutes({
         };
       }
 
-      // ==========================================
-      // SEARCH
-      // ==========================================
-
       if (search) {
         const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
         const regex = new RegExp(escaped, "i");
 
         match.$or = [
-          {
-            displayName: regex,
-          },
-          {
-            email: regex,
-          },
-          {
-            phone: regex,
-          },
+          { displayName: regex },
+          { email: regex },
+          { phone: regex },
           {
             "checkoutProfile.name": regex,
           },
@@ -4791,10 +4512,6 @@ module.exports = async function registerCommerceRoutes({
         ];
       }
 
-      // ==========================================
-      // CURRENT MONTH IN BANGLADESH
-      // ==========================================
-
       const offset = 6 * 60 * 60 * 1000;
 
       const dhaka = new Date(Date.now() + offset);
@@ -4803,17 +4520,10 @@ module.exports = async function registerCommerceRoutes({
         Date.UTC(dhaka.getUTCFullYear(), dhaka.getUTCMonth(), 1) - offset,
       );
 
-      // ==========================================
-      // CUSTOMERS + ORDERS AGGREGATION
-      // ==========================================
-
       const customerPipeline = [
         {
           $match: match,
         },
-
-        // Match each registered user with
-        // orders belonging to their Firebase UID.
         {
           $lookup: {
             from: "orders",
@@ -4852,12 +4562,10 @@ module.exports = async function registerCommerceRoutes({
                 $group: {
                   _id: null,
 
-                  // All customer orders
                   orderCount: {
                     $sum: 1,
                   },
 
-                  // Successfully delivered
                   deliveredOrders: {
                     $sum: {
                       $cond: [
@@ -4870,7 +4578,6 @@ module.exports = async function registerCommerceRoutes({
                     },
                   },
 
-                  // Delivered order value
                   totalSpent: {
                     $sum: {
                       $cond: [
@@ -4904,8 +4611,6 @@ module.exports = async function registerCommerceRoutes({
           },
         },
 
-        // Convert aggregation result into
-        // a single summary object.
         {
           $addFields: {
             summary: {
@@ -4918,10 +4623,6 @@ module.exports = async function registerCommerceRoutes({
             },
           },
         },
-
-        // ======================================
-        // ORDER ACTIVITY FILTER
-        // ======================================
 
         ...(ordersFilter === "with_orders"
           ? [
@@ -4945,10 +4646,6 @@ module.exports = async function registerCommerceRoutes({
               ]
             : []),
 
-        // ======================================
-        // PAGINATION + SAFE PROJECTION
-        // ======================================
-
         {
           $facet: {
             metadata: [
@@ -4961,15 +4658,12 @@ module.exports = async function registerCommerceRoutes({
               {
                 $sort: sorts[sort],
               },
-
               {
                 $skip: skip,
               },
-
               {
                 $limit: perPage,
               },
-
               {
                 $project: {
                   _id: 0,
@@ -5000,7 +4694,6 @@ module.exports = async function registerCommerceRoutes({
                     ],
                   },
 
-                  // Profile image fallback
                   photoUrl: {
                     $ifNull: [
                       "$photoUrl",
@@ -5078,9 +4771,11 @@ module.exports = async function registerCommerceRoutes({
                       {
                         $ifNull: ["$summary.lastOrderId", false],
                       },
+
                       {
                         $toString: "$summary.lastOrderId",
                       },
+
                       null,
                     ],
                   },
@@ -5090,11 +4785,6 @@ module.exports = async function registerCommerceRoutes({
           },
         },
       ];
-
-      // ==========================================
-      // GLOBAL CUSTOMER STATISTICS
-      // Independent of search and filters
-      // ==========================================
 
       const statsPipeline = [
         {
@@ -5150,10 +4840,6 @@ module.exports = async function registerCommerceRoutes({
         },
       ];
 
-      // ==========================================
-      // FETCH DATABASE RESULTS
-      // ==========================================
-
       const [listRows, statsRows, guestOrders] = await Promise.all([
         users.aggregate(customerPipeline).toArray(),
 
@@ -5164,12 +4850,7 @@ module.exports = async function registerCommerceRoutes({
         }),
       ]);
 
-      // ==========================================
-      // FORMAT RESULTS
-      // ==========================================
-
       const list = listRows[0] || {};
-
       const total = list.metadata?.[0]?.total || 0;
 
       const summary = statsRows[0] || {};
@@ -5180,15 +4861,10 @@ module.exports = async function registerCommerceRoutes({
         totalSpent: Math.round((Number(customer.totalSpent) || 0) * 100) / 100,
       }));
 
-      // ==========================================
-      // FINAL RESPONSE
-      // ==========================================
-
       res.set("Cache-Control", "private, no-store");
 
       return res.status(200).json({
         success: true,
-
         customers,
 
         stats: {
@@ -5205,9 +4881,7 @@ module.exports = async function registerCommerceRoutes({
 
         pagination: {
           page,
-
           limit: perPage,
-
           total,
 
           totalPages: Math.max(1, Math.ceil(total / perPage)),
@@ -5220,22 +4894,13 @@ module.exports = async function registerCommerceRoutes({
     }),
   );
 
-  // =====================================================
-  // ADMIN DELIVERY MANAGEMENT
-  // GET /admin/deliveries
-  // Firebase Auth + Active Admin
-  // No automatic status updates
-  // =====================================================
+  // Part 10 — Admin Delivery Management
 
   app.get(
     "/admin/deliveries",
     verifyFirebaseToken,
     verifyAdmin,
     handle(async (req, res) => {
-      // =====================================
-      // PAGINATION & FILTER VALIDATION
-      // =====================================
-
       const rawPage = str(req.query.page ?? "1", 6);
 
       if (!/^[1-9]\d{0,5}$/.test(rawPage)) {
@@ -5270,12 +4935,7 @@ module.exports = async function registerCommerceRoutes({
         fail("Invalid delivery sorting");
       }
 
-      // =====================================
-      // FILTER CONDITIONS
-      // =====================================
-
       const now = new Date();
-
       const nextWeek = new Date(now.getTime() + 7 * 86400000);
 
       const deliveryStatuses = [
@@ -5308,13 +4968,9 @@ module.exports = async function registerCommerceRoutes({
         },
       ];
 
-      // Status filtering
       if (["verified", "processing", "shipped", "delivered"].includes(view)) {
         clauses.push({ status: view });
-      }
-
-      // Overdue shipments
-      else if (view === "overdue") {
+      } else if (view === "overdue") {
         clauses.push({
           status: "shipped",
           estimatedDelivery: {
@@ -5322,10 +4978,7 @@ module.exports = async function registerCommerceRoutes({
             $lt: now,
           },
         });
-      }
-
-      // Deliveries due in next 7 days
-      else if (view === "upcoming") {
+      } else if (view === "upcoming") {
         clauses.push({
           status: "shipped",
           estimatedDelivery: {
@@ -5333,10 +4986,7 @@ module.exports = async function registerCommerceRoutes({
             $lte: nextWeek,
           },
         });
-      }
-
-      // Missing courier information
-      else if (view === "unassigned") {
+      } else if (view === "unassigned") {
         clauses.push(
           {
             status: {
@@ -5346,10 +4996,6 @@ module.exports = async function registerCommerceRoutes({
           missingCourier,
         );
       }
-
-      // =====================================
-      // SEARCH
-      // =====================================
 
       if (search) {
         const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -5373,10 +5019,6 @@ module.exports = async function registerCommerceRoutes({
         $and: clauses,
       };
 
-      // =====================================
-      // SORT
-      // =====================================
-
       const orderBy =
         sort === "oldest"
           ? {
@@ -5394,12 +5036,7 @@ module.exports = async function registerCommerceRoutes({
                 _id: -1,
               };
 
-      // =====================================
-      // FETCH ORDERS, COUNTS & STATS
-      // =====================================
-
       const [docs, total, byStatus, overdueCount] = await Promise.all([
-        // Filtered delivery orders
         orders
           .find(query, {
             projection: {
@@ -5415,7 +5052,6 @@ module.exports = async function registerCommerceRoutes({
 
               "customer.name": 1,
               "customer.phone": 1,
-
               "shipping.phone": 1,
               "shipping.address": 1,
               "shipping.district": 1,
@@ -5440,10 +5076,8 @@ module.exports = async function registerCommerceRoutes({
           .limit(limit)
           .toArray(),
 
-        // Filtered total
         orders.countDocuments(query),
 
-        // Global status stats
         orders
           .aggregate([
             {
@@ -5464,7 +5098,6 @@ module.exports = async function registerCommerceRoutes({
           ])
           .toArray(),
 
-        // Global overdue count
         orders.countDocuments({
           status: "shipped",
           estimatedDelivery: {
@@ -5473,10 +5106,6 @@ module.exports = async function registerCommerceRoutes({
           },
         }),
       ]);
-
-      // =====================================
-      // REGISTERED CUSTOMER PROFILE IMAGES
-      // =====================================
 
       const customerUids = [
         ...new Set(
@@ -5518,32 +5147,19 @@ module.exports = async function registerCommerceRoutes({
         ]),
       );
 
-      // =====================================
-      // STATUS COUNTS
-      // =====================================
-
       const counts = Object.fromEntries(
         byStatus.map((item) => [item._id, item.total]),
       );
-
-      // =====================================
-      // DELIVERY TABLE RESPONSE
-      // =====================================
 
       const deliveries = docs.map((order) => {
         const items = Array.isArray(order.items) ? order.items : [];
 
         return {
           _id: order._id.toString(),
-
           orderNumber: order.orderNumber,
-
           createdAt: order.createdAt,
-
           status: order.status,
-
           total: Number(order.total || 0),
-
           guest: order.guest === true,
 
           customer: {
@@ -5557,11 +5173,8 @@ module.exports = async function registerCommerceRoutes({
 
           courier: {
             name: order.courier?.name || "",
-
             trackingNumber: order.courier?.trackingNumber || "",
-
             trackingUrl: order.courier?.trackingUrl || "",
-
             parcelWeight: order.courier?.parcelWeight || "",
           },
 
@@ -5587,10 +5200,6 @@ module.exports = async function registerCommerceRoutes({
           })),
         };
       });
-
-      // =====================================
-      // FINAL RESPONSE
-      // =====================================
 
       res.set("Cache-Control", "private, no-store");
 
