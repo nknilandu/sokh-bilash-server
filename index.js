@@ -1059,168 +1059,609 @@ async function run() {
     }
   });
 
-  // ==========================================
-  // SHARED PRODUCT VALIDATION
-  // Used by POST and PATCH
-  // ==========================================
+  // ======================================================
+  // PRODUCT ADD / EDIT API
+  //
+  // Existing dependencies in this scope:
+  // app
+  // products
+  // categories
+  // occasions
+  // ObjectId
+  // verifyFirebaseToken
+  // verifyAdmin
+  // getSearchFields
+  // ======================================================
 
-  const buildValidatedProduct = async (data, existing = null) => {
-    const name = String(data.name || "").trim();
-    const sku = normalizeSku(data.sku);
+  const PRODUCT_OPTION_TYPES = ["size", "color", "type"];
 
-    const description = String(data.description || "").trim();
+  const PRODUCT_MAX_VARIANTS = 100;
+  const PRODUCT_MAX_IMAGES = 5;
 
-    const categoryId = String(data.categoryId || "").trim();
+  // ======================================================
+  // HELPERS
+  // ======================================================
 
-    const occasionIds = data.occasionIds;
+  const productFail = (message, status = 400) => {
+    const error = new Error(message);
+    error.status = status;
+    throw error;
+  };
 
-    const regularPrice = Number(data.regularPrice);
+  const productIsRecord = (value) =>
+    value !== null && typeof value === "object" && !Array.isArray(value);
 
-    const salePrice =
-      data.salePrice == null || data.salePrice === ""
-        ? null
-        : Number(data.salePrice);
+  const productHasOwn = (object, key) =>
+    Object.prototype.hasOwnProperty.call(object, key);
 
-    // ============== BASIC VALIDATION ==============
+  const productText = (value, field, maxLength, { required = false } = {}) => {
+    if (value === undefined || value === null) {
+      if (required) {
+        productFail(`${field} is required`);
+      }
 
-    if (!name || !sku || !categoryId) {
-      reject("Product name, SKU and category are required");
+      return "";
     }
 
-    if (!Number.isFinite(regularPrice) || regularPrice <= 0) {
-      reject("Invalid regular price");
+    if (typeof value !== "string") {
+      productFail(`${field} must be a string`);
     }
 
+    const result = value.trim();
+
+    if (required && !result) {
+      productFail(`${field} is required`);
+    }
+
+    if (result.length > maxLength) {
+      productFail(`${field} exceeds ${maxLength} characters`);
+    }
+
+    return result;
+  };
+
+  const productNormalizeLabel = (value) =>
+    String(value ?? "")
+      .normalize("NFKC")
+      .replace(/\p{Cf}/gu, "")
+      .trim()
+      .replace(/\s+/gu, " ")
+      .toLowerCase();
+
+  const productIsReservedDefault = (value) =>
+    ["default", "ডিফল্ট", "ডিফল্ট্"].includes(productNormalizeLabel(value));
+
+  const productNormalizeSku = (value, field = "SKU") =>
+    productText(value, field, 150, {
+      required: true,
+    }).toUpperCase();
+
+  const productValidUrl = (value) => {
+    try {
+      const url = new URL(value);
+
+      return (
+        ["http:", "https:"].includes(url.protocol) &&
+        Boolean(url.hostname) &&
+        !url.username &&
+        !url.password
+      );
+    } catch {
+      return false;
+    }
+  };
+
+  const productValidId = (value) =>
+    typeof value === "string" && /^[a-f0-9]{24}$/i.test(value);
+
+  const productNumber = (value, field, { allowZero = false } = {}) => {
     if (
-      salePrice !== null &&
-      (!Number.isFinite(salePrice) ||
-        salePrice <= 0 ||
-        salePrice >= regularPrice)
+      (typeof value !== "string" && typeof value !== "number") ||
+      (typeof value === "string" && !value.trim())
     ) {
-      reject("Sale price must be lower than regular price");
+      productFail(`${field} must be a valid number`);
     }
 
-    // ============== CATEGORY ==============
+    const result = Number(value);
 
-    const category = await categories.findOne(
-      { id: categoryId },
-      { projection: { _id: 1 } },
+    if (!Number.isFinite(result) || (allowZero ? result < 0 : result <= 0)) {
+      productFail(
+        allowZero
+          ? `${field} must be zero or greater`
+          : `${field} must be greater than zero`,
+      );
+    }
+
+    return result;
+  };
+
+  const productBoolean = (value, field, fallback = false) => {
+    if (value === undefined) return fallback;
+
+    if (typeof value !== "boolean") {
+      productFail(`${field} must be a boolean`);
+    }
+
+    return value;
+  };
+
+  const productBasePrice = (product) => {
+    const regular = Number(product.regularPrice);
+    const sale = Number(product.salePrice);
+
+    return Number.isFinite(sale) && sale > 0 && sale < regular ? sale : regular;
+  };
+
+  const productVariantSignature = (options) =>
+    JSON.stringify(
+      PRODUCT_OPTION_TYPES.map((type) => [
+        type,
+        productNormalizeLabel(options?.[type]),
+      ]),
     );
 
-    if (!category) {
-      reject("Invalid category selected");
+  const productApiError = (res, error, label) => {
+    console.error(label, error);
+
+    const status =
+      Number.isInteger(error.status) &&
+      error.status >= 400 &&
+      error.status <= 599
+        ? error.status
+        : error.code === 11000
+          ? 409
+          : 500;
+
+    return res.status(status).json({
+      success: false,
+      message:
+        status === 500
+          ? "Internal server error"
+          : error.code === 11000
+            ? "Duplicate product information"
+            : error.message,
+    });
+  };
+
+  // ======================================================
+  // REBUILD COMPLETE OVERRIDES FROM SAVED VARIANTS
+  //
+  // Actual variant data is authoritative.
+  // Metadata can retain intentional base-price inheritance.
+  // ======================================================
+
+  function productBuildOverrides(variants, previousOverrides = {}, basePrice) {
+    const source = productIsRecord(previousOverrides) ? previousOverrides : {};
+
+    return Object.fromEntries(
+      variants.map((variant) => {
+        const metadata = productIsRecord(source[variant.key])
+          ? source[variant.key]
+          : {};
+
+        // Only keep the blank-price marker when the actual
+        // saved price agrees with the product's base price.
+        const inheritsBasePrice =
+          metadata.price === "" &&
+          Number.isFinite(Number(variant.price)) &&
+          Number(variant.price) === basePrice;
+
+        return [
+          variant.key,
+          {
+            sku: variant.sku,
+            autoSku:
+              typeof variant.autoSku === "boolean"
+                ? variant.autoSku
+                : metadata.autoSku === true,
+            price: inheritsBasePrice ? "" : variant.price,
+            imageUrl: variant.imageUrl || "",
+            available: variant.available !== false,
+          },
+        ];
+      }),
+    );
+  }
+
+  // ======================================================
+  // SHARED PRODUCT VALIDATION
+  // Used by POST and PATCH.
+  // ======================================================
+
+  const buildValidatedProduct = async (data, existing = null) => {
+    if (!productIsRecord(data)) {
+      productFail("Invalid product information");
     }
 
-    // ============== OCCASIONS ==============
+    // ----------------------------------------------------
+    // BASIC DETAILS
+    // ----------------------------------------------------
 
-    if (
-      !Array.isArray(occasionIds) ||
-      !occasionIds.length ||
-      occasionIds.some((id) => typeof id !== "string" || !id.trim()) ||
-      new Set(occasionIds).size !== occasionIds.length
-    ) {
-      reject("Select at least one valid occasion");
-    }
-
-    const occasionCount = await occasions.countDocuments({
-      id: { $in: occasionIds },
+    const name = productText(data.name, "Product name", 300, {
+      required: true,
     });
 
-    if (occasionCount !== occasionIds.length) {
-      reject("Invalid occasion selected");
+    const sku = productNormalizeSku(data.sku, "Product SKU");
+
+    const description = productText(data.description, "Description", 30000);
+
+    const autoSku = productBoolean(data.autoSku, "autoSku", false);
+
+    const regularPrice = productNumber(data.regularPrice, "Regular price");
+
+    const salePrice =
+      data.salePrice === undefined ||
+      data.salePrice === null ||
+      data.salePrice === ""
+        ? null
+        : productNumber(data.salePrice, "Sale price");
+
+    if (salePrice !== null && salePrice >= regularPrice) {
+      productFail("Sale price must be lower than regular price");
     }
 
-    // ============== IMAGES ==============
+    const basePrice = salePrice !== null ? salePrice : regularPrice;
+
+    const available = productBoolean(data.available, "available", false);
+
+    const featured = productBoolean(data.featured, "featured", false);
+
+    const customizable = productBoolean(
+      data.customizable,
+      "customizable",
+      false,
+    );
+
+    const variantsEnabled = productBoolean(
+      data.variantsEnabled,
+      "variantsEnabled",
+      false,
+    );
+
+    // ----------------------------------------------------
+    // CATEGORY / OCCASIONS
+    // ----------------------------------------------------
+
+    const categoryId = productText(data.categoryId, "Category", 100, {
+      required: true,
+    });
+
+    if (
+      !Array.isArray(data.occasionIds) ||
+      data.occasionIds.length === 0 ||
+      data.occasionIds.length > 100
+    ) {
+      productFail("Select at least one valid occasion");
+    }
+
+    const occasionIds = data.occasionIds.map((value) =>
+      productText(value, "Occasion ID", 100, {
+        required: true,
+      }),
+    );
+
+    if (new Set(occasionIds).size !== occasionIds.length) {
+      productFail("Duplicate occasions are not allowed");
+    }
+
+    const [category, occasionCount] = await Promise.all([
+      categories.findOne({ id: categoryId }, { projection: { _id: 1 } }),
+      occasions.countDocuments({
+        id: { $in: occasionIds },
+      }),
+    ]);
+
+    if (!category) {
+      productFail("Invalid category selected");
+    }
+
+    if (occasionCount !== occasionIds.length) {
+      productFail("Invalid occasion selected");
+    }
+
+    // ----------------------------------------------------
+    // PRODUCT PHOTOS
+    // At least one photo is required for Default.
+    // ----------------------------------------------------
 
     if (
       !Array.isArray(data.images) ||
-      !data.images.length ||
-      data.images.length > 5
+      data.images.length === 0 ||
+      data.images.length > PRODUCT_MAX_IMAGES
     ) {
-      reject("Provide 1 to 5 valid product images");
+      productFail("Provide 1 to 5 valid product images");
     }
 
-    const images = data.images.map((image) => ({
-      id: String(image?.id || ""),
-      url: String(image?.url || "").trim(),
-    }));
+    const images = data.images.map((image, index) => {
+      if (typeof image !== "string" && !productIsRecord(image)) {
+        productFail("Invalid product image");
+      }
 
-    if (images.some((image) => !isValidUrl(image.url))) {
-      reject("Invalid product image URL");
-    }
+      const url = productText(
+        typeof image === "string" ? image : image.url,
+        "Product image URL",
+        4096,
+        { required: true },
+      );
+
+      if (!productValidUrl(url)) {
+        productFail("Invalid product image URL");
+      }
+
+      const id =
+        typeof image === "string" || !image.id
+          ? `product-image-${index + 1}`
+          : productText(image.id, "Image ID", 150, {
+              required: true,
+            });
+
+      return { id, url };
+    });
 
     if (new Set(images.map((image) => image.url)).size !== images.length) {
-      reject("Duplicate image URLs are not allowed");
+      productFail("Duplicate product image URLs are not allowed");
     }
 
-    // ============== VARIANTS ==============
-
-    const variantsEnabled = data.variantsEnabled === true;
-
-    const rawVariants = variantsEnabled ? data.variants : [];
-
-    if (
-      !Array.isArray(rawVariants) ||
-      rawVariants.length > 100 ||
-      (variantsEnabled && rawVariants.length === 0)
-    ) {
-      reject("Invalid variants (maximum 100)");
+    if (new Set(images.map((image) => image.id)).size !== images.length) {
+      productFail("Duplicate product image IDs are not allowed");
     }
 
-    const variants = rawVariants.map((variant) => ({
-      key: String(variant?.key || ""),
-      title: String(variant?.title || ""),
+    // ----------------------------------------------------
+    // OPTION GROUPS
+    // Default is reserved, including disabled groups.
+    // ----------------------------------------------------
 
-      options: {
-        size: String(variant?.options?.size || ""),
+    const sourceOptions = data.options ?? {};
 
-        color: String(variant?.options?.color || ""),
+    if (!productIsRecord(sourceOptions)) {
+      productFail("Invalid variant options");
+    }
 
-        type: String(variant?.options?.type || ""),
-      },
+    const options = {};
 
-      sku: normalizeSku(variant?.sku),
+    for (const type of PRODUCT_OPTION_TYPES) {
+      const group = sourceOptions[type] ?? {};
 
-      autoSku: variant?.autoSku === true,
+      if (!productIsRecord(group)) {
+        productFail(`Invalid ${type} option group`);
+      }
 
-      price: Number(variant?.price),
+      const enabled = productBoolean(group.enabled, `${type}.enabled`, false);
 
-      imageUrl: String(variant?.imageUrl || "").trim(),
+      const rawValues = group.values ?? [];
 
-      available: variant?.available !== false,
-    }));
+      if (!Array.isArray(rawValues) || rawValues.length > 100) {
+        productFail(`${type}: maximum 100 options are allowed`);
+      }
 
-    for (const variant of variants) {
+      const values = rawValues.map((value) => {
+        if (!productIsRecord(value)) {
+          productFail(`${type}: option must contain id and label`);
+        }
+
+        const id = productText(value.id, `${type} option ID`, 100, {
+          required: true,
+        });
+
+        const label = productText(value.label, `${type} option label`, 150, {
+          required: true,
+        });
+
+        if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
+          productFail(`${type}: invalid option ID`);
+        }
+
+        if (productIsReservedDefault(label)) {
+          productFail(
+            `${type}: Default is automatic and cannot be added manually`,
+          );
+        }
+
+        return { id, label };
+      });
+
+      if (new Set(values.map((value) => value.id)).size !== values.length) {
+        productFail(`${type}: duplicate option IDs`);
+      }
+
+      const normalizedLabels = values.map((value) =>
+        productNormalizeLabel(value.label),
+      );
+
+      if (new Set(normalizedLabels).size !== normalizedLabels.length) {
+        productFail(`${type}: duplicate option labels`);
+      }
+
+      options[type] = {
+        enabled,
+        values,
+      };
+    }
+
+    const activeTypes = PRODUCT_OPTION_TYPES.filter(
+      (type) => options[type].enabled && options[type].values.length > 0,
+    );
+
+    // ----------------------------------------------------
+    // VARIANTS
+    // ----------------------------------------------------
+
+    if (data.variants !== undefined && !Array.isArray(data.variants)) {
+      productFail("Variants must be an array");
+    }
+
+    const suppliedVariants = data.variants ?? [];
+
+    // Check reserved names even if variantsEnabled is false.
+    for (const variant of suppliedVariants) {
+      if (!productIsRecord(variant)) {
+        productFail("Invalid variant");
+      }
+
       if (
-        !variant.sku ||
-        !Number.isFinite(variant.price) ||
-        variant.price <= 0 ||
-        (variant.imageUrl && !isValidUrl(variant.imageUrl))
+        productIsReservedDefault(variant.title) ||
+        PRODUCT_OPTION_TYPES.some((type) =>
+          productIsReservedDefault(variant.options?.[type]),
+        )
       ) {
-        reject("Invalid variant SKU, price or image URL");
+        productFail("Default is automatic; do not create a Default variant");
       }
     }
 
-    // ============== UNIQUE SKU ==============
+    const rawVariants = variantsEnabled ? suppliedVariants : [];
+
+    if (
+      rawVariants.length > PRODUCT_MAX_VARIANTS ||
+      (variantsEnabled && rawVariants.length === 0)
+    ) {
+      productFail("Provide 1 to 100 variants when variants are enabled");
+    }
+
+    if (variantsEnabled && activeTypes.length === 0) {
+      productFail("Enable at least one Size, Color or Type option group");
+    }
+
+    const variants = rawVariants.map((rawVariant) => {
+      const key = productText(rawVariant.key, "Variant key", 200, {
+        required: true,
+      });
+
+      if (!/^[a-zA-Z0-9_:|-]+$/.test(key)) {
+        productFail("Invalid variant key");
+      }
+
+      if (!productIsRecord(rawVariant.options)) {
+        productFail("Invalid variant options");
+      }
+
+      const variantOptions = {};
+
+      for (const type of PRODUCT_OPTION_TYPES) {
+        const label = productText(
+          rawVariant.options[type],
+          `Variant ${type}`,
+          150,
+        );
+
+        if (productIsReservedDefault(label)) {
+          productFail("Default cannot be used as a saved variant option");
+        }
+
+        if (activeTypes.includes(type)) {
+          if (!label) {
+            productFail(`Variant ${key}: ${type} is required`);
+          }
+
+          const matchingOption = options[type].values.find(
+            (option) =>
+              productNormalizeLabel(option.label) ===
+              productNormalizeLabel(label),
+          );
+
+          if (!matchingOption) {
+            productFail(
+              `Variant ${key}: ${type} does not match the configured options`,
+            );
+          }
+
+          // Store the canonical label from the option group.
+          variantOptions[type] = matchingOption.label;
+        } else {
+          if (label) {
+            productFail(
+              `Variant ${key}: ${type} is not an active option group`,
+            );
+          }
+
+          variantOptions[type] = "";
+        }
+      }
+
+      const title = activeTypes.map((type) => variantOptions[type]).join(" / ");
+
+      const variantSku = productNormalizeSku(
+        rawVariant.sku,
+        `Variant ${title} SKU`,
+      );
+
+      const price = productNumber(rawVariant.price, `Variant ${title} price`);
+
+      const imageUrl = productText(
+        rawVariant.imageUrl,
+        `Variant ${title} image URL`,
+        4096,
+      );
+
+      if (imageUrl && !productValidUrl(imageUrl)) {
+        productFail(`Variant ${title}: invalid image URL`);
+      }
+
+      return {
+        // Preserve the submitted existing key.
+        // Do not regenerate keys or SKUs on the server.
+        key,
+        title,
+        options: variantOptions,
+        sku: variantSku,
+        autoSku: productBoolean(
+          rawVariant.autoSku,
+          `Variant ${title} autoSku`,
+          false,
+        ),
+        price,
+        imageUrl,
+        available: productBoolean(
+          rawVariant.available,
+          `Variant ${title} available`,
+          true,
+        ),
+      };
+    });
+
+    const variantKeys = variants.map((variant) => variant.key);
+
+    if (new Set(variantKeys).size !== variantKeys.length) {
+      productFail("Duplicate variant keys are not allowed");
+    }
+
+    const signatures = variants.map((variant) =>
+      productVariantSignature(variant.options),
+    );
+
+    if (new Set(signatures).size !== signatures.length) {
+      productFail("Duplicate variant combinations are not allowed");
+    }
+
+    // ----------------------------------------------------
+    // COMPLETE VARIANT OVERRIDES
+    // ----------------------------------------------------
+
+    const rawOverrides = data.variantOverrides ?? {};
+
+    if (!productIsRecord(rawOverrides)) {
+      productFail("Invalid variant overrides");
+    }
+
+    const variantOverrides = productBuildOverrides(
+      variants,
+      rawOverrides,
+      basePrice,
+    );
+
+    // ----------------------------------------------------
+    // SKU UNIQUENESS
+    // ----------------------------------------------------
 
     const allSkus = [sku, ...variants.map((variant) => variant.sku)];
 
     if (new Set(allSkus).size !== allSkus.length) {
-      reject("Product and variant SKUs must be unique", 409);
+      productFail("Product and variant SKUs must be unique", 409);
     }
 
     const duplicate = await products.findOne(
       {
         ...(existing ? { _id: { $ne: existing._id } } : {}),
-
-        $or: [
-          { sku: { $in: allSkus } },
-          {
-            "variants.sku": {
-              $in: allSkus,
-            },
-          },
-        ],
+        $or: [{ sku: { $in: allSkus } }, { "variants.sku": { $in: allSkus } }],
       },
       {
         projection: { _id: 1 },
@@ -1228,185 +1669,104 @@ async function run() {
     );
 
     if (duplicate) {
-      reject("Product or variant SKU already exists", 409);
+      productFail("Product or variant SKU already exists", 409);
     }
 
-    // ============== VARIANT OPTIONS ==============
+    // ----------------------------------------------------
+    // PACKAGING
+    // ----------------------------------------------------
 
-    const sourceOptions = data.options || {};
+    const packaging = data.packaging ?? "regular";
 
-    if (typeof sourceOptions !== "object" || Array.isArray(sourceOptions)) {
-      reject("Invalid variant options");
+    if (!["regular", "premium"].includes(packaging)) {
+      productFail("Invalid packaging");
     }
 
-    const options = {};
+    const premiumBoxPrice = productNumber(
+      data.premiumBoxPrice ?? 0,
+      "Premium box price",
+      { allowZero: true },
+    );
 
-    for (const type of ["size", "color", "type"]) {
-      const group = sourceOptions[type] || {};
-      const values = group.values || [];
+    // ----------------------------------------------------
+    // CUSTOMER CUSTOMIZATION
+    // ----------------------------------------------------
 
-      if (
-        !Array.isArray(values) ||
-        values.length > 100 ||
-        values.some(
-          (value) =>
-            typeof value?.id !== "string" ||
-            typeof value?.label !== "string" ||
-            !value.label.trim(),
-        )
-      ) {
-        reject("Invalid variant option value");
-      }
+    const requestedFieldType = data.customerFieldType ?? "none";
 
-      options[type] = {
-        enabled: group.enabled === true,
-
-        values: values.map((value) => ({
-          id: value.id,
-          label: value.label.trim(),
-        })),
-      };
+    if (!["none", "frame", "note"].includes(requestedFieldType)) {
+      productFail("Invalid customer field type");
     }
 
-    // ============== VARIANT OVERRIDES ==============
+    const customerFieldType = customizable ? requestedFieldType : "none";
 
-    const rawOverrides = data.variantOverrides || {};
-
-    if (typeof rawOverrides !== "object" || Array.isArray(rawOverrides)) {
-      reject("Invalid variant overrides");
-    }
-
-    const variantOverrides = {};
-
-    for (const [key, value] of Object.entries(rawOverrides)) {
-      if (
-        !key ||
-        key.length > 200 ||
-        !/^[a-zA-Z0-9_:|-]+$/.test(key) ||
-        !value ||
-        typeof value !== "object" ||
-        Array.isArray(value)
-      ) {
-        reject("Invalid variant override");
-      }
-
-      const price =
-        value.price == null || value.price === "" ? "" : Number(value.price);
-
-      const imageUrl = String(value.imageUrl || "").trim();
-
-      if (
-        (price !== "" && (!Number.isFinite(price) || price <= 0)) ||
-        (imageUrl && !isValidUrl(imageUrl))
-      ) {
-        reject("Invalid variant override price or image");
-      }
-
-      variantOverrides[key] = {
-        autoSku: value.autoSku !== false,
-
-        sku: normalizeSku(value.sku),
-
-        price,
-
-        imageUrl,
-
-        available: value.available !== false,
-      };
-    }
-
-    // ============== PACKAGING ==============
-
-    const premiumBoxPrice = Number(data.premiumBoxPrice);
-
-    if (!Number.isFinite(premiumBoxPrice) || premiumBoxPrice < 0) {
-      reject("Invalid premium box price");
-    }
-
-    // ============== CUSTOMIZATION ==============
-
-    const customizable = data.customizable === true;
-
-    const customerFieldType =
-      customizable && ["frame", "note"].includes(data.customerFieldType)
-        ? data.customerFieldType
-        : "none";
-
-    const customerFields = !customizable
-      ? []
-      : customerFieldType === "frame"
-        ? [
-            {
-              key: "photos",
-              label: "আপনার ছবি আপলোড করুন",
-              type: "file",
-              maxFiles: 20,
-            },
-            {
-              key: "name",
-              label: "নাম",
-              type: "text",
-            },
-            {
-              key: "dob",
-              label: "জন্মতারিখ / বিবাহবার্ষিকী",
-              type: "date",
-            },
-            {
-              key: "engraving",
-              label: "ফ্রেমের নিচের খোদাই বার্তা / উইশ",
-              type: "textarea",
-            },
-          ]
-        : customerFieldType === "note"
+    const customerFields =
+      !customizable || customerFieldType === "none"
+        ? []
+        : customerFieldType === "frame"
           ? [
+              {
+                key: "photos",
+                label: "আপনার ছবি আপলোড করুন",
+                type: "file",
+                maxFiles: 20,
+              },
+              {
+                key: "name",
+                label: "নাম",
+                type: "text",
+              },
+              {
+                key: "dob",
+                label: "জন্মতারিখ / বিবাহবার্ষিকী",
+                type: "date",
+              },
+              {
+                key: "engraving",
+                label: "ফ্রেমের নিচের খোদাই বার্তা / উইশ",
+                type: "textarea",
+              },
+            ]
+          : [
               {
                 key: "customNote",
                 label: "বিশেষ নির্দেশনা",
                 type: "textarea",
               },
-            ]
-          : [];
+            ];
 
-    // ============== FINAL PRODUCT FIELDS ==============
+    // ----------------------------------------------------
+    // VALIDATED DOCUMENT
+    // ----------------------------------------------------
 
     return {
       name,
       sku,
-      autoSku: data.autoSku === true,
+      autoSku,
       description,
-
       regularPrice,
       salePrice,
-
       categoryId,
       occasionIds,
       images,
-
-      available: data.available === true,
-      featured: data.featured === true,
+      available,
+      featured,
       customizable,
-
       variantsEnabled,
       options,
-      variantOverrides,
       variants,
-
+      variantOverrides,
       customerFieldType,
       customerFields,
-
-      surpriseBox: data.surpriseBox === true,
-
-      packaging: data.packaging === "premium" ? "premium" : "regular",
-
+      packaging,
       premiumBoxPrice,
     };
   };
 
-  // ==========================================
+  // ======================================================
   // ADMIN ADD PRODUCT
   // POST /admin/products
-  // ==========================================
+  // ======================================================
 
   app.post(
     "/admin/products",
@@ -1414,7 +1774,7 @@ async function run() {
     verifyAdmin,
     async (req, res) => {
       try {
-        const document = await buildValidatedProduct(req.body || {});
+        const document = await buildValidatedProduct(req.body);
 
         const _id = new ObjectId();
 
@@ -1434,7 +1794,6 @@ async function run() {
           ...document,
           slug,
           status: "published",
-
           createdBy: req.user.uid,
           createdAt: now,
           updatedAt: now,
@@ -1442,16 +1801,199 @@ async function run() {
 
         Object.assign(product, await getSearchFields(product));
 
-        const result = await products.insertOne(product);
+        await products.insertOne(product);
 
-        return res.status(201).send({
+        res.set("Cache-Control", "no-store");
+
+        return res.status(201).json({
           success: true,
           message: "Product added successfully",
-          insertedId: result.insertedId.toString(),
+          insertedId: _id.toString(),
           slug,
         });
       } catch (error) {
-        return respondError(res, error, "Add Product Error");
+        return productApiError(res, error, "Add Product Error:");
+      }
+    },
+  );
+
+  // ======================================================
+  // ADMIN GET SINGLE PRODUCT
+  // GET /admin/products/:productId
+  // ======================================================
+
+  app.get(
+    "/admin/products/:productId",
+    verifyFirebaseToken,
+    verifyAdmin,
+    async (req, res) => {
+      try {
+        const { productId } = req.params;
+
+        if (!productValidId(productId)) {
+          productFail("Invalid product ID");
+        }
+
+        const product = await products.findOne({
+          _id: new ObjectId(productId),
+          status: { $ne: "deleted" },
+        });
+
+        if (!product) {
+          productFail("Product not found", 404);
+        }
+
+        const variants = Array.isArray(product.variants)
+          ? product.variants
+          : [];
+
+        // Response repair only.
+        // GET does not write anything to the database.
+        const variantOverrides = productBuildOverrides(
+          variants,
+          product.variantOverrides,
+          productBasePrice(product),
+        );
+
+        res.set("Cache-Control", "no-store");
+
+        return res.json({
+          success: true,
+          message: "Product fetched successfully",
+          product: {
+            ...product,
+            _id: product._id.toString(),
+            variants,
+            variantOverrides,
+          },
+        });
+      } catch (error) {
+        return productApiError(res, error, "Get Admin Product Error:");
+      }
+    },
+  );
+
+  // ======================================================
+  // ADMIN UPDATE PRODUCT
+  // PATCH /admin/products/:productId
+  // ======================================================
+
+  app.patch(
+    "/admin/products/:productId",
+    verifyFirebaseToken,
+    verifyAdmin,
+    async (req, res) => {
+      try {
+        const { productId } = req.params;
+
+        if (!productValidId(productId)) {
+          productFail("Invalid product ID");
+        }
+
+        if (!productIsRecord(req.body)) {
+          productFail("Invalid request body");
+        }
+
+        const _id = new ObjectId(productId);
+
+        const existing = await products.findOne({
+          _id,
+          status: { $ne: "deleted" },
+        });
+
+        if (!existing) {
+          productFail("Product not found", 404);
+        }
+
+        const changes = Object.fromEntries(
+          Object.entries(req.body).filter(([field]) =>
+            PATCHABLE_FIELDS.has(field),
+          ),
+        );
+
+        if (!Object.keys(changes).length) {
+          productFail("No valid fields to update");
+        }
+
+        const merged = {
+          ...existing,
+          ...changes,
+        };
+
+        // For structural variant edits, require the final
+        // variant array so stale data is not combined silently.
+        const changingVariantStructure =
+          productHasOwn(changes, "options") ||
+          productHasOwn(changes, "variantOverrides") ||
+          (productHasOwn(changes, "variantsEnabled") &&
+            changes.variantsEnabled !== existing.variantsEnabled);
+
+        if (
+          merged.variantsEnabled === true &&
+          changingVariantStructure &&
+          !productHasOwn(changes, "variants")
+        ) {
+          productFail(
+            "Send the complete variants array when changing variant options or overrides",
+          );
+        }
+
+        const document = await buildValidatedProduct(merged, existing);
+
+        const now = new Date();
+
+        const updatedProduct = {
+          ...document,
+          updatedBy: req.user.uid,
+          updatedAt: now,
+        };
+
+        // Keep the existing slug and unrelated product fields.
+        // Prevent the removed Surprise Box field contributing
+        // to regenerated search data.
+        const searchProduct = {
+          ...existing,
+          ...updatedProduct,
+        };
+
+        delete searchProduct.surpriseBox;
+
+        Object.assign(updatedProduct, await getSearchFields(searchProduct));
+
+        // Detect another update occurring after this read.
+        const updateFilter = {
+          _id,
+          status: { $ne: "deleted" },
+          updatedAt: productHasOwn(existing, "updatedAt")
+            ? existing.updatedAt
+            : { $exists: false },
+        };
+
+        const result = await products.updateOne(updateFilter, {
+          $set: updatedProduct,
+          $unset: {
+            surpriseBox: "",
+          },
+        });
+
+        if (!result.matchedCount) {
+          productFail(
+            "Product changed during this update. Reload and try again.",
+            409,
+          );
+        }
+
+        res.set("Cache-Control", "no-store");
+
+        return res.json({
+          success: true,
+          message: "Product updated successfully",
+          updatedId: productId,
+          variantCount: document.variants.length,
+          updatedAt: now,
+        });
+      } catch (error) {
+        return productApiError(res, error, "Update Product Error:");
       }
     },
   );
@@ -1712,56 +2254,8 @@ async function run() {
   );
 
   // ==========================================
-  // GET SINGLE ADMIN PRODUCT
-  // ==========================================
-
-  app.get(
-    "/admin/products/:productId",
-    verifyFirebaseToken,
-    verifyAdmin,
-    async (req, res) => {
-      try {
-        const { productId } = req.params;
-
-        if (!isMongoId(productId)) {
-          return res.status(400).send({
-            success: false,
-            message: "Invalid product ID",
-          });
-        }
-
-        const product = await products.findOne({
-          _id: new ObjectId(productId),
-          status: { $ne: "deleted" },
-        });
-
-        if (!product) {
-          return res.status(404).send({
-            success: false,
-            message: "Product not found",
-          });
-        }
-
-        res.set("Cache-Control", "no-store");
-
-        return res.send({
-          success: true,
-          message: "Product fetched successfully",
-
-          product: {
-            ...product,
-            _id: product._id.toString(),
-          },
-        });
-      } catch (error) {
-        return respondError(res, error, "Get Admin Product Error");
-      }
-    },
-  );
-
-  // ==========================================
-  // ADMIN UPDATE PRODUCT
-  // PATCH /admin/products/:productId
+  // ALLOWED PRODUCT UPDATE FIELDS
+  // Used by the product PATCH route above.
   // ==========================================
 
   const PATCHABLE_FIELDS = new Set([
@@ -1787,92 +2281,10 @@ async function run() {
     "variants",
 
     "customerFieldType",
-    "surpriseBox",
 
     "packaging",
     "premiumBoxPrice",
   ]);
-
-  app.patch(
-    "/admin/products/:productId",
-    verifyFirebaseToken,
-    verifyAdmin,
-    async (req, res) => {
-      try {
-        const { productId } = req.params;
-
-        if (!isMongoId(productId)) {
-          reject("Invalid product ID");
-        }
-
-        if (
-          !req.body ||
-          typeof req.body !== "object" ||
-          Array.isArray(req.body)
-        ) {
-          reject("Invalid request body");
-        }
-
-        const _id = new ObjectId(productId);
-
-        const existing = await products.findOne({
-          _id,
-        });
-
-        if (!existing) {
-          reject("Product not found", 404);
-        }
-
-        const changes = Object.fromEntries(
-          Object.entries(req.body).filter(([field]) =>
-            PATCHABLE_FIELDS.has(field),
-          ),
-        );
-
-        if (!Object.keys(changes).length) {
-          reject("No valid fields to update");
-        }
-
-        const document = await buildValidatedProduct(
-          {
-            ...existing,
-            ...changes,
-          },
-          existing,
-        );
-
-        const updatedProduct = {
-          ...document,
-          updatedBy: req.user.uid,
-          updatedAt: new Date(),
-        };
-
-        Object.assign(
-          updatedProduct,
-          await getSearchFields({
-            ...existing,
-            ...updatedProduct,
-          }),
-        );
-
-        await products.updateOne(
-          { _id },
-          {
-            $set: updatedProduct,
-          },
-        );
-
-        return res.send({
-          success: true,
-          message: "Product updated successfully",
-
-          updatedId: productId,
-        });
-      } catch (error) {
-        return respondError(res, error, "Update Product Error");
-      }
-    },
-  );
 
   // ==========================================
   // UPDATE PRODUCT AVAILABILITY

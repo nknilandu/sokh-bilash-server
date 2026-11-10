@@ -473,15 +473,61 @@ module.exports = async function registerCommerceRoutes({
     if (!product) fail("Product not found", 404);
     if (product.available !== true) fail("Product unavailable", 409);
 
+    //===================
     let variant = null;
     let variantKey = "";
 
     if (product.variantsEnabled === true) {
-      variantKey = str(raw.variantKey, 220);
-      variant = (product.variants || []).find((v) => v.key === variantKey);
+      // Missing / empty key means the base product: Default.
+      if (
+        raw.variantKey !== undefined &&
+        raw.variantKey !== null &&
+        typeof raw.variantKey !== "string"
+      ) {
+        fail("Invalid variant selection", 400);
+      }
 
-      if (!variant || variant.available === false) {
-        fail("Variant unavailable", 409);
+      variantKey = str(raw.variantKey ?? "", 220);
+
+      if (variantKey === "") {
+        // Default requires at least one valid Product Photo.
+        const hasProductPhoto =
+          Array.isArray(product.images) &&
+          product.images.some((image) => {
+            const value = typeof image === "string" ? image : image?.url;
+
+            if (typeof value !== "string" || !value.trim()) {
+              return false;
+            }
+
+            try {
+              const url = new URL(value);
+
+              return (
+                ["https:", "http:"].includes(url.protocol) &&
+                Boolean(url.hostname)
+              );
+            } catch {
+              return false;
+            }
+          });
+
+        if (!hasProductPhoto) {
+          fail("Default option requires at least one product photo", 409);
+        }
+
+        // Keep variant null:
+        // existing pricing uses the base regular/sale price.
+        variant = null;
+      } else {
+        // A provided key must identify a real available variant.
+        variant = (product.variants || []).find(
+          (item) => item.key === variantKey,
+        );
+
+        if (!variant || variant.available === false) {
+          fail("Variant unavailable", 409);
+        }
       }
     }
 
@@ -1613,10 +1659,25 @@ module.exports = async function registerCommerceRoutes({
     );
   };
 
+  // ==========================================
+  // GET MY ORDERS
+  // GET /orders/my
+  //
+  // Search:
+  // - Order number: full or partial
+  // - Product name: full or partial
+  //
+  // Filters:
+  // - Order status
+  // - Payment status
+  // ==========================================
+
   app.get(
     "/orders/my",
     verifyFirebaseToken,
     handle(async (req, res) => {
+      res.set("Cache-Control", "no-store");
+
       const uid = req.user?.uid;
 
       if (!uid) {
@@ -1645,6 +1706,10 @@ module.exports = async function registerCommerceRoutes({
         });
       }
 
+      // ======================================
+      // PAGINATION
+      // ======================================
+
       const rawPage = req.query.page === undefined ? "1" : req.query.page;
 
       if (
@@ -1659,6 +1724,10 @@ module.exports = async function registerCommerceRoutes({
       const perPage = 10;
       const skip = (page - 1) * perPage;
 
+      // ======================================
+      // QUERY VALIDATION
+      // ======================================
+
       const readFilter = (value, maxLength = 60) => {
         if (value === undefined) return "";
 
@@ -1666,8 +1735,18 @@ module.exports = async function registerCommerceRoutes({
           fail("Invalid filter parameter", 400);
         }
 
-        return str(value, maxLength);
+        const result = value.trim();
+
+        if (result.length > maxLength) {
+          fail(`Filter must not exceed ${maxLength} characters`, 400);
+        }
+
+        return result;
       };
+
+      // Treat user input as literal text, not regex syntax.
+      const escapeSearchRegex = (value) =>
+        value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
       const status = readFilter(req.query.status, 40).toLowerCase();
 
@@ -1676,9 +1755,7 @@ module.exports = async function registerCommerceRoutes({
         40,
       ).toLowerCase();
 
-      const search = readFilter(req.query.search, 60)
-        .replace(/^#/, "")
-        .toUpperCase();
+      const search = readFilter(req.query.search, 120).replace(/^#/, "").trim();
 
       const allowedOrderStatuses = new Set([
         "pending",
@@ -1711,9 +1788,10 @@ module.exports = async function registerCommerceRoutes({
         fail("Invalid payment status filter", 400);
       }
 
-      if (search && !/^[A-Z0-9-]{1,60}$/.test(search)) {
-        fail("Invalid order number search", 400);
-      }
+      // ======================================
+      // BUILD QUERY
+      // Always restrict results to this user.
+      // ======================================
 
       const query = { uid };
 
@@ -1726,8 +1804,42 @@ module.exports = async function registerCommerceRoutes({
       }
 
       if (search) {
-        query.orderNumber = new RegExp(`^${search}`);
+        // Full or partial order number.
+        const orderNumberRegex = new RegExp(escapeSearchRegex(search), "i");
+
+        // All entered words must occur in the same
+        // product name, in any order.
+        //
+        // Example:
+        // "ফটো ফ্রেম" matches
+        // "প্রিমিয়াম ফটো ফ্রেম".
+        const words = [...new Set(search.split(/\s+/u).filter(Boolean))];
+
+        const productNameConditions = words.map((word) => ({
+          name: {
+            $regex: new RegExp(escapeSearchRegex(word), "i"),
+          },
+        }));
+
+        query.$or = [
+          {
+            orderNumber: {
+              $regex: orderNumberRegex,
+            },
+          },
+          {
+            items: {
+              $elemMatch: {
+                $and: productNameConditions,
+              },
+            },
+          },
+        ];
       }
+
+      // ======================================
+      // PUBLIC LIST FIELDS
+      // ======================================
 
       const projection = {
         _id: 1,
@@ -1742,6 +1854,10 @@ module.exports = async function registerCommerceRoutes({
         "items.quantity": 1,
       };
 
+      // ======================================
+      // FETCH ORDERS, TOTAL AND STATS
+      // ======================================
+
       const [orderDocuments, filteredTotal, statusCounts] = await Promise.all([
         orders
           .find(query, { projection })
@@ -1752,9 +1868,13 @@ module.exports = async function registerCommerceRoutes({
 
         orders.countDocuments(query),
 
+        // Dashboard stats cover all of this user's
+        // orders, independently of search filters.
         orders
           .aggregate([
-            { $match: { uid } },
+            {
+              $match: { uid },
+            },
             {
               $group: {
                 _id: "$status",
@@ -1764,6 +1884,10 @@ module.exports = async function registerCommerceRoutes({
           ])
           .toArray(),
       ]);
+
+      // ======================================
+      // FORMAT RESPONSE
+      // ======================================
 
       const formattedOrders = orderDocuments.map((order) => {
         const items = Array.isArray(order.items) ? order.items : [];
@@ -1814,8 +1938,6 @@ module.exports = async function registerCommerceRoutes({
         delivered: counts.delivered || 0,
         cancelled: (counts.cancelled || 0) + (counts.rejected || 0),
       };
-
-      res.set("Cache-Control", "no-store");
 
       return res.status(200).json({
         success: true,
